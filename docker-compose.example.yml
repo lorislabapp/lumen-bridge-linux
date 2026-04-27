@@ -1,0 +1,25 @@
+# Drop-in example for users who run Frigate via docker-compose. Add this
+# service alongside your existing `frigate` service so the bridge can
+# subscribe to its MQTT broker on the same Docker network.
+
+services:
+  lumen-bridge:
+    image: ghcr.io/lorislabapp/lumen-bridge-linux:latest
+    container_name: lumen-bridge
+    restart: unless-stopped
+
+    # Mount a host directory so config.yaml + the cached user token survive
+    # container recreates. Set strict perms on the host (`chmod 700`).
+    volumes:
+      - ./lumen-bridge:/data
+
+    # Until the v0.2.0 web auth flow ships, both tokens are passed via env.
+    # Generate them once via the CloudKit Dashboard + iCloud sign-in flow,
+    # then paste them here. Treat them as secrets — they grant write access
+    # to your iCloud private database.
+    environment:
+      LB_CK_API_TOKEN: ${LUMEN_CK_API_TOKEN:?set in .env}
+      LB_CK_USER_TOKEN: ${LUMEN_CK_USER_TOKEN:?set in .env}
+
+    # The bridge only talks outbound (MQTT to your broker, HTTPS to
+    # Apple). No inbound port required.

@@ -1,0 +1,51 @@
+# Lumen Bridge — Frigate ↔ iCloud CloudKit relay
+#
+# Install location: /etc/systemd/system/lumen-bridge.service
+# Binary:           /usr/local/bin/lumen-bridge
+# Config:           /etc/lumen-bridge/config.yaml (mode 0600, owned by lumen-bridge user)
+# State:            /var/lib/lumen-bridge/ (token cache)
+
+[Unit]
+Description=Lumen Bridge — forwards Frigate detection events to iCloud CloudKit
+Documentation=https://github.com/lorislabapp/lumen-bridge-linux
+After=network-online.target
+Wants=network-online.target
+# If your Frigate runs on the same host as a systemd service, uncomment:
+# After=docker.service frigate.service
+
+[Service]
+Type=simple
+User=lumen-bridge
+Group=lumen-bridge
+
+ExecStart=/usr/local/bin/lumen-bridge run --config /etc/lumen-bridge/config.yaml
+
+# Persistent state lives under /var/lib/lumen-bridge — created automatically.
+StateDirectory=lumen-bridge
+StateDirectoryMode=0700
+
+# Hardening — the bridge does not need any of these privileges.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# Auto-restart with backoff. Frigate-side broker hiccups shouldn't kill the
+# bridge — but if the process panics, restart it.
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target

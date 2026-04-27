@@ -1,0 +1,27 @@
+# Binaries
+/lumen-bridge
+/build/
+/dist/
+
+# Go
+*.test
+*.out
+*.coverprofile
+vendor/
+
+# Local config / secrets — NEVER commit
+config.yaml
+config.local.yaml
+.env
+.env.*
+*.token
+*.private.pem
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Container build artefacts
+*.tar
