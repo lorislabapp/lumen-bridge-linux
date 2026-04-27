@@ -1,0 +1,36 @@
+# Lumen Bridge for Linux — example configuration.
+# Copy to ./config.yaml or /etc/lumen-bridge/config.yaml and edit.
+# Every field is overridable via env var (LB_*). Env wins over file.
+
+mqtt:
+  # Frigate's MQTT broker. This is your Mosquitto / EMQX / VerneMQ —
+  # NOT the Frigate web host. Look at frigate.yml `mqtt.host` to find it.
+  host: 192.168.1.50
+  port: 1883
+  # Set tls: true and port: 8883 for TLS brokers.
+  tls: false
+  # Optional. Empty = anonymous (Mosquitto default with allow_anonymous=true).
+  username: frigate
+  password: change-me
+  # Frigate's default — change only if you've customised topic_prefix in frigate.yml.
+  topic_prefix: frigate
+  # Used as the MQTT client ID. Make it unique if you run multiple bridges
+  # against the same broker.
+  client_id: lumen-bridge-linux
+
+cloudkit:
+  # The container the macOS Bridge writes to. Don't change unless you're
+  # forking the project under your own Apple Developer account.
+  container: iCloud.com.lorislabapp.lumenbridge
+  environment: production           # or "development" while testing
+  # Where the user token (obtained via `lumen-bridge auth`) is cached.
+  # Defaults to ~/.config/lumen-bridge/token.json — set explicitly here
+  # if you run as a service user with a non-default home dir.
+  user_token_path: ~/.config/lumen-bridge/token.json
+
+# Optional. Set to enable clip-MP4 backfill on event-end. Without this,
+# events still forward with their snapshot but the iOS clients won't see
+# the recorded video. Should point to your Frigate web UI host (port 5000
+# by default).
+frigate:
+  base_url: http://192.168.1.50:5000
