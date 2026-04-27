@@ -8,8 +8,8 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
-  packages: write
+  contents: write   # required by softprops/action-gh-release on tag pushes
+  packages: write   # required to push the multi-arch image to ghcr.io
   id-token: write
 
 jobs:

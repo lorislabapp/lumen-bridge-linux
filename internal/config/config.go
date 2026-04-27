@@ -17,6 +17,7 @@ import (
 type Config struct {
 	MQTT     MQTTConfig     `yaml:"mqtt"`
 	CloudKit CloudKitConfig `yaml:"cloudkit"`
+	Frigate  FrigateConfig  `yaml:"frigate"`
 }
 
 type MQTTConfig struct {
@@ -26,6 +27,15 @@ type MQTTConfig struct {
 	Password    string `yaml:"password"`
 	TopicPrefix string `yaml:"topic_prefix"`
 	ClientID    string `yaml:"client_id"`
+	TLS         bool   `yaml:"tls"` // true → ssl://host:port (typically port 8883)
+}
+
+// FrigateConfig is optional. Provide the HTTP base URL (e.g.
+// http://frigate.local:5000) to enable clip-MP4 backfill on `end` events.
+// Omit to skip clip uploads — events will still be forwarded with their
+// snapshot.
+type FrigateConfig struct {
+	BaseURL string `yaml:"base_url"`
 }
 
 type CloudKitConfig struct {
@@ -110,6 +120,12 @@ func overlayEnv(c *Config) {
 	}
 	if v := os.Getenv("LB_MQTT_CLIENT_ID"); v != "" {
 		c.MQTT.ClientID = v
+	}
+	if v := os.Getenv("LB_MQTT_TLS"); v != "" {
+		c.MQTT.TLS = v == "true" || v == "1" || v == "yes"
+	}
+	if v := os.Getenv("LB_FRIGATE_BASE_URL"); v != "" {
+		c.Frigate.BaseURL = v
 	}
 	if v := os.Getenv("LB_CK_CONTAINER"); v != "" {
 		c.CloudKit.Container = v

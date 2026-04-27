@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -15,11 +17,12 @@ import (
 	"github.com/lorislabapp/lumen-bridge-linux/internal/bridge"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/cloudkit"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/config"
+	"github.com/lorislabapp/lumen-bridge-linux/internal/frigate"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/health"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/mqtt"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -31,6 +34,8 @@ func main() {
 		runCmd(os.Args[2:])
 	case "auth":
 		authCmd(os.Args[2:])
+	case "doctor":
+		doctorCmd(os.Args[2:])
 	case "version", "--version":
 		fmt.Println("lumen-bridge", version)
 	case "help", "--help", "-h":
@@ -53,6 +58,8 @@ Subcommands:
             --health-addr ADDR  bind address for /healthz (default 127.0.0.1:9090)
   auth    interactive Apple ID sign-in (one-time per host)
             --bind-addr ADDR    bind address for the local paste form (default 127.0.0.1:0)
+  doctor  preflight check: config, MQTT reachability, Frigate reachability,
+          CloudKit auth. Exits non-zero on any check failure.
   version print version and exit
 
 Configuration: ./config.yaml or /etc/lumen-bridge/config.yaml; every
@@ -80,11 +87,14 @@ func runCmd(args []string) {
 		"version", version,
 		"mqtt_host", cfg.MQTT.Host,
 		"mqtt_port", cfg.MQTT.Port,
+		"mqtt_tls", cfg.MQTT.TLS,
 		"ck_container", cfg.CloudKit.Container,
 		"ck_environment", cfg.CloudKit.Environment,
+		"frigate_base_url", cfg.Frigate.BaseURL,
 		"dry_run", *dryRun,
 		"health_addr", *healthAddr)
 
+	snapshots := mqtt.NewSnapshotCache(30 * time.Minute)
 	mqttCli := mqtt.New(mqtt.Options{
 		Host:        cfg.MQTT.Host,
 		Port:        cfg.MQTT.Port,
@@ -92,6 +102,8 @@ func runCmd(args []string) {
 		Password:    cfg.MQTT.Password,
 		TopicPrefix: cfg.MQTT.TopicPrefix,
 		ClientID:    cfg.MQTT.ClientID,
+		TLS:         cfg.MQTT.TLS,
+		Snapshots:   snapshots,
 		Logger:      logger,
 	})
 
@@ -115,14 +127,26 @@ func runCmd(args []string) {
 		})
 	}
 
+	var frigateCli *frigate.Client
+	if cfg.Frigate.BaseURL != "" {
+		frigateCli = frigate.New(cfg.Frigate.BaseURL)
+	}
+
 	coord := bridge.New(bridge.Options{
-		MQTT:   mqttCli,
-		CK:     ckCli,
-		Logger: logger,
+		MQTT:      mqttCli,
+		CK:        ckCli,
+		Snapshots: snapshots,
+		Frigate:   frigateCli,
+		Logger:    logger,
 	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Periodic snapshot cache sweep — drops entries older than the cache
+	// TTL so a long-lived daemon doesn't accumulate stale JPEGs for
+	// cameras that have been removed from Frigate's config.
+	go sweepSnapshots(ctx, snapshots, logger)
 
 	var wg sync.WaitGroup
 	if *healthAddr != "" {
@@ -199,6 +223,84 @@ func authCmd(args []string) {
 	fmt.Println()
 	fmt.Println("  Next:")
 	fmt.Println("    lumen-bridge run")
+}
+
+// doctorCmd runs a preflight check before the user starts the daemon
+// for real. Each step is independent so a single failure (e.g. Frigate
+// HTTP unreachable) doesn't mask the rest.
+func doctorCmd(args []string) {
+	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
+	cfgPath := fs.String("config", "", "path to config.yaml")
+	_ = fs.Parse(args)
+
+	cfg, err := config.Load(*cfgPath)
+	check("config load", err)
+
+	// MQTT TCP reachability — much cheaper than a full CONNECT, lets us
+	// distinguish "DNS broken" from "broker rejected auth".
+	dialAddr := net.JoinHostPort(cfg.MQTT.Host, fmt.Sprintf("%d", cfg.MQTT.Port))
+	conn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
+	if err == nil {
+		_ = conn.Close()
+	}
+	check("mqtt tcp reach "+dialAddr, err)
+
+	// CloudKit credentials — does the user have something to use?
+	tokens, err := auth.Load(cfg.CloudKit.UserTokenPath)
+	check("cloudkit token load", err)
+	if tokens != nil {
+		fmt.Println("  cloudkit api token: present")
+		if tokens.UserToken == "" {
+			fmt.Println("  ⚠ cloudkit user token: missing — run `lumen-bridge auth` to obtain one")
+		} else {
+			fmt.Println("  cloudkit user token: present")
+		}
+	} else {
+		fmt.Println("  ⚠ cloudkit tokens: none — daemon will only run with --dry-run; run `lumen-bridge auth` to authenticate")
+	}
+
+	// Frigate HTTP — only checked if base_url is configured.
+	if cfg.Frigate.BaseURL != "" {
+		req, _ := http.NewRequest(http.MethodGet, cfg.Frigate.BaseURL+"/api/version", nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		check("frigate http "+cfg.Frigate.BaseURL, err)
+	} else {
+		fmt.Println("  frigate http: skipped (frigate.base_url not set — clip backfill disabled)")
+	}
+
+	fmt.Println()
+	fmt.Println("✓ doctor complete")
+}
+
+func check(label string, err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", label, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  ✓ %s\n", label)
+}
+
+// sweepSnapshots runs Sweep() every 5 minutes to drop expired retained
+// JPEGs. Lightweight; just walks the cache map under a write lock.
+func sweepSnapshots(ctx context.Context, cache *mqtt.SnapshotCache, logger *slog.Logger) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if dropped := cache.Sweep(); dropped > 0 {
+				logger.Debug("snapshot cache swept", "dropped", dropped)
+			}
+		}
+	}
 }
 
 func defaultHealthAddr() string {

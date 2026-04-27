@@ -10,7 +10,7 @@ import (
 type Record struct {
 	RecordType string         // e.g. "FrigateEvent"
 	RecordName string         // CKRecord.ID.recordName — must be unique within the type
-	Fields     map[string]any // typed values — strings, numbers, dates, [string], etc.
+	Fields     map[string]any // typed values — strings, numbers, dates, [string], *AssetReceipt, etc.
 }
 
 // toJSON renders a Record into the wire shape CloudKit Web Services expects.
@@ -45,6 +45,23 @@ func encodeField(v any) map[string]any {
 	case time.Time:
 		// CloudKit stores dates as Unix-millis since 1970-01-01.
 		return map[string]any{"value": x.UnixMilli(), "type": "TIMESTAMP"}
+	case *AssetReceipt:
+		// Asset fields are populated AFTER UploadAsset returns. The wire
+		// representation uses the type "ASSETID" with the receipt bundle
+		// inline as the value.
+		if x == nil {
+			return nil
+		}
+		return map[string]any{
+			"type": "ASSETID",
+			"value": map[string]any{
+				"fileChecksum":      x.FileChecksum,
+				"size":              x.Size,
+				"wrappingKey":       x.WrappingKey,
+				"referenceChecksum": x.ReferenceChecksum,
+				"receipt":           x.Receipt,
+			},
+		}
 	default:
 		// Unknown types fall back to string-ised representation; safer than
 		// silent drop because the missing field would only show up at iOS
@@ -70,18 +87,28 @@ type FrigateEvent struct {
 	Zones     []string
 	TopScore  float64
 	StartTime time.Time
+	// Snapshot / Clip are optional; populate after UploadAsset succeeds.
+	Snapshot *AssetReceipt
+	Clip     *AssetReceipt
 }
 
 func (e FrigateEvent) ToRecord() *Record {
+	fields := map[string]any{
+		"camera":     e.Camera,
+		"label":      e.Label,
+		"zones":      e.Zones,
+		"topScore":   e.TopScore,
+		"detectedAt": e.StartTime,
+	}
+	if e.Snapshot != nil {
+		fields["snapshot"] = e.Snapshot
+	}
+	if e.Clip != nil {
+		fields["clip"] = e.Clip
+	}
 	return &Record{
 		RecordType: "FrigateEvent",
 		RecordName: e.ID,
-		Fields: map[string]any{
-			"camera":     e.Camera,
-			"label":      e.Label,
-			"zones":      e.Zones,
-			"topScore":   e.TopScore,
-			"detectedAt": e.StartTime,
-		},
+		Fields:     fields,
 	}
 }

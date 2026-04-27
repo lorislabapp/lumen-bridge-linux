@@ -60,10 +60,12 @@ type Client struct {
 	password    string
 	topicPrefix string
 	clientID    string
+	tls         bool
 	logger      *slog.Logger
 
-	client paho.Client
-	onEvent Handler
+	client    paho.Client
+	onEvent   Handler
+	snapshots *SnapshotCache
 }
 
 type Options struct {
@@ -73,6 +75,8 @@ type Options struct {
 	Password    string
 	TopicPrefix string
 	ClientID    string
+	TLS         bool           // tcp:// (false) vs ssl:// (true)
+	Snapshots   *SnapshotCache // nil = don't subscribe to retained snapshots
 	Logger      *slog.Logger
 }
 
@@ -87,6 +91,8 @@ func New(opts Options) *Client {
 		password:    opts.Password,
 		topicPrefix: opts.TopicPrefix,
 		clientID:    opts.ClientID,
+		tls:         opts.TLS,
+		snapshots:   opts.Snapshots,
 		logger:      opts.Logger.With("component", "mqtt"),
 	}
 }
@@ -100,8 +106,12 @@ func (c *Client) Connect(ctx context.Context, onEvent Handler) error {
 	}
 	c.onEvent = onEvent
 
+	scheme := "tcp"
+	if c.tls {
+		scheme = "ssl"
+	}
 	opts := paho.NewClientOptions().
-		AddBroker(fmt.Sprintf("tcp://%s:%d", c.host, c.port)).
+		AddBroker(fmt.Sprintf("%s://%s:%d", scheme, c.host, c.port)).
 		SetClientID(c.clientID).
 		SetUsername(c.username).
 		SetPassword(c.password).
@@ -137,11 +147,18 @@ func (c *Client) IsConnected() bool {
 	return c.client != nil && c.client.IsConnected()
 }
 
-func (c *Client) onConnected(_ paho.Client) {
+func (c *Client) onConnected(client paho.Client) {
 	topic := fmt.Sprintf("%s/events", c.topicPrefix)
-	c.logger.Info("connected; subscribing", "topic", topic)
-	if tok := c.client.Subscribe(topic, 0, c.handleMessage); tok.Wait() && tok.Error() != nil {
+	c.logger.Info("connected; subscribing", "topic", topic, "tls", c.tls)
+	if tok := client.Subscribe(topic, 0, c.handleMessage); tok.Wait() && tok.Error() != nil {
 		c.logger.Error("subscribe failed", "err", tok.Error())
+	}
+	if c.snapshots != nil {
+		if err := c.snapshots.Subscribe(client, c.topicPrefix); err != nil {
+			c.logger.Error("snapshot subscribe failed", "err", err)
+		} else {
+			c.logger.Info("snapshot cache subscribed", "topic", c.topicPrefix+"/+/+/snapshot")
+		}
 	}
 }
 
