@@ -130,6 +130,13 @@ func (c *Client) Disconnect() {
 	}
 }
 
+// IsConnected reports whether the broker connection is currently up. False
+// during the initial dial, after a network drop, and during reconnect
+// attempts. Used by /readyz to gate the daemon's readiness signal.
+func (c *Client) IsConnected() bool {
+	return c.client != nil && c.client.IsConnected()
+}
+
 func (c *Client) onConnected(_ paho.Client) {
 	topic := fmt.Sprintf("%s/events", c.topicPrefix)
 	c.logger.Info("connected; subscribing", "topic", topic)
