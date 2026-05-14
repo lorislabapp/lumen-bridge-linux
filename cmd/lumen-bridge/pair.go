@@ -21,7 +21,7 @@ import (
 func pairCmd(args []string) {
 	fs := flag.NewFlagSet("pair", flag.ExitOnError)
 	code := fs.String("code", "", "6-digit pairing code from app (required)")
-	relayURL := fs.String("relay", "wss://lumen-bridge-relay-dev.4c3e2b246dc1b838e47ed33cbbe3a39c.workers.dev", "Relay server URL")
+	relayURL := fs.String("relay", "wss://lumen-bridge-relay.mail5491.workers.dev", "Relay server URL")
 	fs.Parse(args)
 
 	if *code == "" {
