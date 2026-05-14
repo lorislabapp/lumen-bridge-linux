@@ -39,8 +39,8 @@
 #### Component 1: Relay Service (Cloudflare Worker)
 **Repo:** https://github.com/lorislabapp/lumen-bridge-relay  
 **Stack:** TypeScript, Durable Objects, KV rate limiting  
-**Deployed:** `lumen-bridge-relay-dev` (Version 2d87b668)  
-**URL:** https://lumen-bridge-relay-dev.4c3e2b246dc1b838e47ed33cbbe3a39c.workers.dev
+**Deployed:** `lumen-bridge-relay` (Version 0ad59b4d)  
+**URL:** https://lumen-bridge-relay.mail5491.workers.dev
 
 **Features:**
 - `POST /pair/create` — Generate 6-digit pairing code
@@ -53,6 +53,7 @@
 
 **Commits:**
 ```
+Latest  [relay] configure prod + dev bindings for KV and DO
 e42a5b0 [relay] add rate limiting (100 req/hour per IP)
 2d08c55 [relay] feat: CloudKit token relay service
 ```
@@ -82,7 +83,9 @@ lumen-bridge pair --code 837249
 
 **Commits:**
 ```
-5f8a1b3 [bridge] use workers.dev URL for relay (MVP)
+Latest  [bridge] fix: use correct workers.dev URL for relay (mail5491 subdomain)
+Latest  [docs] add session summary and next steps
+fa9bdd5 [bridge] use workers.dev URL for relay (MVP)
 dfba762 [bridge] feat: add pair command for app-based token provisioning
 ```
 
@@ -113,7 +116,8 @@ dfba762 [bridge] feat: add pair command for app-based token provisioning
 
 **Commits:**
 ```
-8a9f2c1 [lumen] use workers.dev URL for pairing relay (MVP)
+Latest  [lumen] fix: use correct workers.dev URL for relay (mail5491 subdomain)
+4b6a13f [lumen] use workers.dev URL for pairing relay (MVP)
 cdf80ee [lumen] feat: Bridge pairing UI and service
 ```
 
@@ -181,7 +185,7 @@ Decryption:
 
 ### 5. ✅ Git & GitHub
 
-**Commits:** 9 commits across 3 repos  
+**Commits:** 13 commits across 3 repos (includes URL fixes + deployment config)  
 **Lines of code:** ~2,500 lines
 - Relay: ~450 lines (TypeScript)
 - Bridge: ~220 lines (Go)
@@ -199,18 +203,19 @@ Decryption:
 
 ### 6. ✅ Cloudflare Deployment
 
-**Status:** Deployed to dev environment  
-**Worker:** `lumen-bridge-relay-dev`  
-**Version:** 2d87b668-8ab2-4ef3-bf25-84cf2fd2a032  
-**Deployed:** 2026-05-14 18:37:48 UTC  
-**URL:** https://lumen-bridge-relay-dev.4c3e2b246dc1b838e47ed33cbbe3a39c.workers.dev
+**Status:** ✅ Deployed and verified  
+**Worker:** `lumen-bridge-relay`  
+**Version:** 0ad59b4d-7ec5-4264-8749-6b3e6f8be88c  
+**Deployed:** 2026-05-14 19:00:57 UTC  
+**URL:** https://lumen-bridge-relay.mail5491.workers.dev  
+**Health Check:** ✅ `{"status":"ok"}`
 
 **Bindings:**
 - Durable Object: PAIRING_SESSIONS → PairingSession
 - KV: RATE_LIMIT → 103f9f605ffa41588382f0537b8c55ae (shared with lumen-push)
 - Vars: CF_ACCOUNT_ID
 
-**Note:** Custom domain (relay-dev.lorislab.fr) requires migrating lorislab.fr nameservers to Cloudflare. For MVP, using workers.dev URL directly.
+**Note:** Custom domain requires migrating lorislab.fr nameservers to Cloudflare. For MVP, using workers.dev URL directly (works immediately).
 
 ---
 
