@@ -34,6 +34,8 @@ func main() {
 		runCmd(os.Args[2:])
 	case "auth":
 		authCmd(os.Args[2:])
+	case "pair":
+		pairCmd(os.Args[2:])
 	case "doctor":
 		doctorCmd(os.Args[2:])
 	case "version", "--version":
@@ -58,6 +60,9 @@ Subcommands:
             --health-addr ADDR  bind address for /healthz (default 127.0.0.1:9090)
   auth    interactive Apple ID sign-in (one-time per host)
             --bind-addr ADDR    bind address for the local paste form (default 127.0.0.1:0)
+  pair    pair with Lumen app to receive CloudKit token (recommended)
+            --code CODE         6-digit pairing code from app (required)
+            --relay URL         relay server URL (default wss://relay.lorislab.fr)
   doctor  preflight check: config, MQTT reachability, Frigate reachability,
           CloudKit auth. Exits non-zero on any check failure.
   version print version and exit

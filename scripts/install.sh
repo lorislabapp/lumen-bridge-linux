@@ -15,6 +15,10 @@
 #   systemctl enable --now lumen-bridge
 set -euo pipefail
 
+# Some minimal LXC images set TMPDIR to a path that doesn't exist
+# yet (e.g. /tmp/user/0). Force a known-good location so mktemp works.
+export TMPDIR=/tmp
+
 VERSION="${LB_VERSION:-v0.2.0}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 case "$ARCH" in
