@@ -1,4 +1,4 @@
-# Lumen Bridge for Linux — example configuration.
+# Lumen Bridge for Linux — example configuration (v0.3.0).
 # Copy to ./config.yaml or /etc/lumen-bridge/config.yaml and edit.
 # Every field is overridable via env var (LB_*). Env wins over file.
 
@@ -18,19 +18,21 @@ mqtt:
   # against the same broker.
   client_id: lumen-bridge-linux
 
-cloudkit:
-  # The container the macOS Bridge writes to. Don't change unless you're
-  # forking the project under your own Apple Developer account.
-  container: iCloud.com.lorislabapp.lumenbridge
-  environment: production           # or "development" while testing
-  # Where the user token (obtained via `lumen-bridge auth`) is cached.
-  # Defaults to ~/.config/lumen-bridge/token.json — set explicitly here
-  # if you run as a service user with a non-default home dir.
-  user_token_path: ~/.config/lumen-bridge/token.json
+relay:
+  # Lumen Bridge Relay Worker. Don't change unless you're self-hosting
+  # the relay against your own CloudKit container.
+  url: https://relay.lorislab.fr
+  # Where the device token (obtained via `lumen-bridge pair --code <6-digit>`
+  # after generating a code in the Lumen iOS app) is cached. Defaults to
+  # ~/.config/lumen-bridge/device-token.json — set explicitly here if you
+  # run as a service user with a non-default home dir.
+  device_token_path: ~/.config/lumen-bridge/device-token.json
 
 # Optional. Set to enable clip-MP4 backfill on event-end. Without this,
 # events still forward with their snapshot but the iOS clients won't see
 # the recorded video. Should point to your Frigate web UI host (port 5000
 # by default).
+# (Phase 2.5: clip backfill is currently a no-op pending the Worker's
+# signed-URL proxy. Snapshots are deferred to the same phase.)
 frigate:
   base_url: http://192.168.1.50:5000

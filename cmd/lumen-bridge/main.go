@@ -13,16 +13,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/lorislabapp/lumen-bridge-linux/internal/auth"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/bridge"
-	"github.com/lorislabapp/lumen-bridge-linux/internal/cloudkit"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/config"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/frigate"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/health"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/mqtt"
+	"github.com/lorislabapp/lumen-bridge-linux/internal/relay"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -33,7 +32,11 @@ func main() {
 	case "run":
 		runCmd(os.Args[2:])
 	case "auth":
-		authCmd(os.Args[2:])
+		// Deprecated in v0.3.0 — kept as an explicit error so users on
+		// older docs get a clear pointer rather than silent breakage.
+		fmt.Fprintln(os.Stderr, "`lumen-bridge auth` was removed in v0.3.0 (CloudKit Web Services sign-in is unreliable).")
+		fmt.Fprintln(os.Stderr, "Use `lumen-bridge pair --code <6-digit>` instead, after generating a code in the iOS Lumen app.")
+		os.Exit(2)
 	case "pair":
 		pairCmd(os.Args[2:])
 	case "doctor":
@@ -50,25 +53,29 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `lumen-bridge — Frigate ↔ iCloud CloudKit relay (`+version+`)
+	fmt.Fprint(os.Stderr, `lumen-bridge — Frigate ↔ Lumen Bridge Relay (`+version+`)
 
 Subcommands:
   run     start the bridge daemon (default for systemd / Docker)
             --config PATH       config.yaml location
-            --dry-run           subscribe + decode events but skip CloudKit writes
+            --dry-run           subscribe + decode events but skip relay writes
             --debug             verbose logging
             --health-addr ADDR  bind address for /healthz (default 127.0.0.1:9090)
-  auth    interactive Apple ID sign-in (one-time per host)
-            --bind-addr ADDR    bind address for the local paste form (default 127.0.0.1:0)
-  pair    pair with Lumen app to receive CloudKit token (recommended)
+  pair    pair with Lumen app to receive a device token from the relay
             --code CODE         6-digit pairing code from app (required)
             --relay URL         relay server URL (default wss://relay.lorislab.fr)
   doctor  preflight check: config, MQTT reachability, Frigate reachability,
-          CloudKit auth. Exits non-zero on any check failure.
+          relay reachability. Exits non-zero on any check failure.
   version print version and exit
 
 Configuration: ./config.yaml or /etc/lumen-bridge/config.yaml; every
-field is overridable via env var (LB_*). See README.md and docs/AUTH.md.
+field is overridable via env var (LB_*). See README.md.
+
+NOTE on v0.3.0: the CloudKit Web Services sign-in flow (`+"`lumen-bridge auth`"+`)
+was removed because Apple's IDMSA web auth is unreliable for end-users.
+The daemon now talks to the Lumen Bridge Relay Worker via a per-user
+device token from the pair flow. See the project memory note
+project_relay_proxy_migration.md.
 `)
 }
 
@@ -93,8 +100,7 @@ func runCmd(args []string) {
 		"mqtt_host", cfg.MQTT.Host,
 		"mqtt_port", cfg.MQTT.Port,
 		"mqtt_tls", cfg.MQTT.TLS,
-		"ck_container", cfg.CloudKit.Container,
-		"ck_environment", cfg.CloudKit.Environment,
+		"relay_url", cfg.Relay.URL,
 		"frigate_base_url", cfg.Frigate.BaseURL,
 		"dry_run", *dryRun,
 		"health_addr", *healthAddr)
@@ -112,24 +118,26 @@ func runCmd(args []string) {
 		Logger:      logger,
 	})
 
-	var ckCli *cloudkit.Client
+	var relayCli *relay.Client
 	if !*dryRun {
-		tokens, err := auth.Load(cfg.CloudKit.UserTokenPath)
+		stored, err := relay.LoadDeviceToken(cfg.Relay.DeviceTokenPath)
 		if err != nil {
-			logger.Error("auth load failed", "err", err)
+			logger.Error("device token load failed", "err", err, "path", cfg.Relay.DeviceTokenPath)
 			os.Exit(1)
 		}
-		if tokens == nil {
-			logger.Error("no tokens; run `lumen-bridge auth` or set LB_CK_API_TOKEN + LB_CK_USER_TOKEN, or pass --dry-run to test without CloudKit")
+		if stored == nil {
+			logger.Error("no device token — run `lumen-bridge pair --code <6-digit>` after generating a code in the Lumen iOS app, or set LB_RELAY_DEVICE_TOKEN, or pass --dry-run")
 			os.Exit(1)
 		}
-		ckCli = cloudkit.New(cloudkit.Options{
-			Container:   cfg.CloudKit.Container,
-			Environment: cloudkit.Environment(cfg.CloudKit.Environment),
-			APIToken:    tokens.APIToken,
-			UserToken:   tokens.UserToken,
+		relayCli, err = relay.New(relay.Options{
+			RelayURL:    cfg.Relay.URL,
+			DeviceToken: stored.Token,
 			Logger:      logger,
 		})
+		if err != nil {
+			logger.Error("relay client init failed", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	var frigateCli *frigate.Client
@@ -139,7 +147,7 @@ func runCmd(args []string) {
 
 	coord := bridge.New(bridge.Options{
 		MQTT:      mqttCli,
-		CK:        ckCli,
+		Relay:     relayCli,
 		Snapshots: snapshots,
 		Frigate:   frigateCli,
 		Logger:    logger,
@@ -174,61 +182,9 @@ func runCmd(args []string) {
 	wg.Wait()
 }
 
-func authCmd(args []string) {
-	fs := flag.NewFlagSet("auth", flag.ExitOnError)
-	cfgPath := fs.String("config", "", "path to config.yaml")
-	bindAddr := fs.String("bind-addr", "127.0.0.1:0", "where to listen for the paste form")
-	debug := fs.Bool("debug", false, "verbose logging")
-	_ = fs.Parse(args)
-
-	logger := newLogger(*debug)
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		logger.Error("config load failed", "err", err)
-		os.Exit(1)
-	}
-
-	apiToken := os.Getenv("LB_CK_API_TOKEN")
-	if apiToken == "" {
-		logger.Error("LB_CK_API_TOKEN env var is required for auth (this is the *container* API token; generate one in CloudKit Dashboard — see docs/AUTH.md)")
-		os.Exit(1)
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	tokens, err := auth.Interactive(ctx, auth.InteractiveOptions{
-		APIToken:   apiToken,
-		OutputPath: cfg.CloudKit.UserTokenPath,
-		BindAddr:   *bindAddr,
-		Timeout:    10 * time.Minute,
-		NotifyReady: func(localURL, helperURL string) {
-			fmt.Println()
-			fmt.Println("✦ Lumen Bridge — sign-in helper")
-			fmt.Println()
-			fmt.Println("  1. Open this URL in any browser to walk through sign-in:")
-			fmt.Println("       ", localURL)
-			fmt.Println()
-			fmt.Println("  2. The form will direct you to Apple's sign-in page; on success")
-			fmt.Println("     paste the resulting ckSession token back into the form.")
-			fmt.Println()
-			fmt.Println("  Token will be saved to:", cfg.CloudKit.UserTokenPath)
-			fmt.Println("  Listening for the form submission… (timeout: 10 min)")
-			fmt.Println()
-		},
-	})
-	if err != nil {
-		logger.Error("auth failed", "err", err)
-		os.Exit(1)
-	}
-
-	fmt.Println()
-	fmt.Println("✓ token saved to", cfg.CloudKit.UserTokenPath)
-	fmt.Println("  issued at:", tokens.IssuedAt.Format(time.RFC3339))
-	fmt.Println()
-	fmt.Println("  Next:")
-	fmt.Println("    lumen-bridge run")
-}
+// authCmd removed in v0.3.0 — see the switch on os.Args[1] for the
+// deprecation message users see. The dispatcher exits before reaching
+// any handler.
 
 // doctorCmd runs a preflight check before the user starts the daemon
 // for real. Each step is independent so a single failure (e.g. Frigate
@@ -250,18 +206,30 @@ func doctorCmd(args []string) {
 	}
 	check("mqtt tcp reach "+dialAddr, err)
 
-	// CloudKit credentials — does the user have something to use?
-	tokens, err := auth.Load(cfg.CloudKit.UserTokenPath)
-	check("cloudkit token load", err)
-	if tokens != nil {
-		fmt.Println("  cloudkit api token: present")
-		if tokens.UserToken == "" {
-			fmt.Println("  ⚠ cloudkit user token: missing — run `lumen-bridge auth` to obtain one")
-		} else {
-			fmt.Println("  cloudkit user token: present")
+	// Device token — present?
+	stored, err := relay.LoadDeviceToken(cfg.Relay.DeviceTokenPath)
+	check("device token load", err)
+	if stored != nil {
+		fmt.Println("  device token: present")
+		if stored.UserRef != "" {
+			fmt.Println("  user ref:    ", stored.UserRef)
 		}
 	} else {
-		fmt.Println("  ⚠ cloudkit tokens: none — daemon will only run with --dry-run; run `lumen-bridge auth` to authenticate")
+		fmt.Println("  ⚠ device token: missing — daemon will only run with --dry-run; run `lumen-bridge pair --code <6-digit>` after generating a code in the Lumen iOS app")
+	}
+
+	// Relay reachability — best-effort GET /health, doesn't fail
+	// preflight if down because the daemon retries forever anyway.
+	relayHealth := cfg.Relay.URL + "/health"
+	if req, err := http.NewRequest(http.MethodGet, relayHealth, nil); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx)
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		check("relay http "+relayHealth, err)
 	}
 
 	// Frigate HTTP — only checked if base_url is configured.

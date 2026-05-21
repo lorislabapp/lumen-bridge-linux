@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,7 +22,7 @@ import (
 func pairCmd(args []string) {
 	fs := flag.NewFlagSet("pair", flag.ExitOnError)
 	code := fs.String("code", "", "6-digit pairing code from app (required)")
-	relayURL := fs.String("relay", "wss://lumen-bridge-relay.mail5491.workers.dev", "Relay server URL")
+	relayURL := fs.String("relay", "wss://relay.lorislab.fr", "Relay server URL (default points to the production Lumen Bridge Relay)")
 	fs.Parse(args)
 
 	if *code == "" {
@@ -106,7 +107,7 @@ func runPairing(code string, relayBaseURL string) error {
 				fmt.Printf("⚠️  Warning: failed to confirm to relay: %v\n", err)
 			}
 
-			fmt.Printf("\n✅ Token received and saved to ~/.config/lumen-bridge/token.json\n")
+			fmt.Printf("\n✅ Device token received and saved to ~/.config/lumen-bridge/device-token.json\n")
 			fmt.Printf("✅ Bridge is ready\n\n")
 			fmt.Printf("Next steps:\n")
 			fmt.Printf("  1. Restart the bridge: systemctl restart lumen-bridge\n")
@@ -163,34 +164,60 @@ func decryptPairingToken(encryptedB64 string, code string) (string, error) {
 	return string(plaintext), nil
 }
 
-// savePairingToken saves the CloudKit token to config file
-func savePairingToken(token string) error {
-	// Create config directory
+// savePairingToken persists the device token received from the iOS app
+// via the pair-relay WebSocket. As of v0.3.0 the payload is the
+// relay-issued bearer token (NOT a CloudKit ckSession); the iOS app
+// shapes it as a JSON envelope so we can carry the row id + user_ref +
+// scope alongside the raw secret.
+//
+// On-disk format matches relay.StoredDeviceToken so the daemon's
+// `relay.LoadDeviceToken` reads it back unmodified.
+//
+// Envelope shape we expect after decryption:
+//   { "token": "<base64url>", "id": "<uuid>", "user_ref": "lumen-user-...", "scope": "bridge" }
+//
+// If the payload is a bare string (older app builds), we wrap it
+// ourselves with sensible defaults so the bridge still starts.
+func savePairingToken(payload string) error {
 	configDir := filepath.Join(os.Getenv("HOME"), ".config", "lumen-bridge")
 	if configDir == "/.config/lumen-bridge" {
-		// Fallback if HOME not set (running as root)
 		configDir = "/root/.config/lumen-bridge"
 	}
-
-	if err := os.MkdirAll(configDir, 0700); err != nil {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		return fmt.Errorf("failed to create config dir: %w", err)
 	}
 
-	// Prepare token JSON
-	tokenJSON := map[string]string{
-		"ckSession": token,
+	type envelope struct {
+		Token   string `json:"token"`
+		ID      string `json:"id,omitempty"`
+		UserRef string `json:"user_ref,omitempty"`
+		Scope   string `json:"scope,omitempty"`
 	}
 
-	data, err := json.MarshalIndent(tokenJSON, "", "  ")
+	var env envelope
+	trimmed := strings.TrimSpace(payload)
+	if strings.HasPrefix(trimmed, "{") {
+		if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
+			return fmt.Errorf("decode token envelope: %w", err)
+		}
+		if env.Token == "" {
+			return fmt.Errorf("token envelope missing 'token' field")
+		}
+	} else {
+		// Bare string fallback — wrap as bridge-scoped device token.
+		env = envelope{Token: trimmed, Scope: "bridge"}
+	}
+
+	data, err := json.MarshalIndent(env, "", "  ")
 	if err != nil {
-		return fmt.Errorf("failed to marshal token: %w", err)
+		return fmt.Errorf("marshal envelope: %w", err)
 	}
 
-	// Write to file
-	tokenFile := filepath.Join(configDir, "token.json")
-	if err := os.WriteFile(tokenFile, data, 0600); err != nil {
+	// New file path matches the relay config default; legacy
+	// token.json is left alone in case the operator wants to roll back.
+	tokenFile := filepath.Join(configDir, "device-token.json")
+	if err := os.WriteFile(tokenFile, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write token file: %w", err)
 	}
-
 	return nil
 }

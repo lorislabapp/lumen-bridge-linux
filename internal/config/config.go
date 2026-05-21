@@ -16,8 +16,22 @@ import (
 
 type Config struct {
 	MQTT     MQTTConfig     `yaml:"mqtt"`
-	CloudKit CloudKitConfig `yaml:"cloudkit"`
+	Relay    RelayConfig    `yaml:"relay"`
+	CloudKit CloudKitConfig `yaml:"cloudkit"` // deprecated, retained for legacy config files
 	Frigate  FrigateConfig  `yaml:"frigate"`
+}
+
+// RelayConfig configures the HTTP client to the Lumen Bridge Relay Worker.
+// As of 2026-05-21 this is the primary credential surface — see
+// memory/project_relay_proxy_migration.md. Direct-CloudKit fields under
+// CloudKitConfig remain in the schema only so existing config files don't
+// fail to parse; they're ignored at runtime.
+type RelayConfig struct {
+	// URL of the Worker, e.g. https://relay.lorislab.fr
+	URL string `yaml:"url"`
+	// Path to the device-token file produced by `lumen-bridge pair`.
+	// Defaults to ~/.config/lumen-bridge/device-token.json.
+	DeviceTokenPath string `yaml:"device_token_path"`
 }
 
 type MQTTConfig struct {
@@ -80,6 +94,10 @@ func defaults() *Config {
 			TopicPrefix: "frigate",
 			ClientID:    "lumen-bridge-linux",
 		},
+		Relay: RelayConfig{
+			URL:             "https://relay.lorislab.fr",
+			DeviceTokenPath: filepath.Join(home, ".config", "lumen-bridge", "device-token.json"),
+		},
 		CloudKit: CloudKitConfig{
 			Container:     "iCloud.com.lorislabapp.lumenbridge",
 			Environment:   "production",
@@ -139,17 +157,25 @@ func overlayEnv(c *Config) {
 	if v := os.Getenv("LB_CK_USER_TOKEN_PATH"); v != "" {
 		c.CloudKit.UserTokenPath = v
 	}
+	if v := os.Getenv("LB_RELAY_URL"); v != "" {
+		c.Relay.URL = v
+	}
+	if v := os.Getenv("LB_RELAY_DEVICE_TOKEN_PATH"); v != "" {
+		c.Relay.DeviceTokenPath = v
+	}
 }
 
 func (c *Config) validate() error {
 	if c.MQTT.Host == "" {
 		return fmt.Errorf("mqtt.host is required (set in config.yaml or via LB_MQTT_HOST)")
 	}
-	if c.CloudKit.Container == "" {
-		return fmt.Errorf("cloudkit.container is required")
+	if c.Relay.URL == "" {
+		return fmt.Errorf("relay.url is required (default: https://relay.lorislab.fr)")
 	}
-	if c.CloudKit.Environment != "production" && c.CloudKit.Environment != "development" {
-		return fmt.Errorf("cloudkit.environment must be 'production' or 'development', got %q", c.CloudKit.Environment)
+	if c.Relay.DeviceTokenPath == "" {
+		return fmt.Errorf("relay.device_token_path is required")
 	}
+	// CloudKit fields are no longer validated — left in the struct for
+	// legacy config compatibility but ignored at runtime.
 	return nil
 }

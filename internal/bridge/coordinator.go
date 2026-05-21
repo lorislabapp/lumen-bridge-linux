@@ -1,7 +1,14 @@
-// Package bridge wires together the MQTT subscriber, the snapshot cache,
-// the Frigate HTTP client, and the CloudKit writer. The Coordinator owns
-// the receive-count / forward-count counters and the per-event upload
-// pipeline (snapshot first, record write second, clip backfill on `end`).
+// Package bridge wires together the MQTT subscriber and the relay HTTP
+// client that forwards Frigate events to the Lumen Bridge Relay Worker.
+// The Coordinator owns the receive/forward counters and the per-event
+// pipeline.
+//
+// Pre-2026-05-21 the Coordinator wrote directly to CloudKit via a
+// container-API-token + ckSession flow. That path is dead — Apple's
+// IDMSA web sign-in is unreliable for end-users — and the daemon now
+// posts to the Worker, which signs Server-to-Server requests on the
+// bridge's behalf using a per-user device token from the pair flow.
+// See memory/project_relay_proxy_migration.md.
 package bridge
 
 import (
@@ -9,30 +16,30 @@ import (
 	"log/slog"
 	"sync/atomic"
 
-	"github.com/lorislabapp/lumen-bridge-linux/internal/cloudkit"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/frigate"
 	"github.com/lorislabapp/lumen-bridge-linux/internal/mqtt"
+	"github.com/lorislabapp/lumen-bridge-linux/internal/relay"
 )
 
 type Options struct {
 	MQTT      *mqtt.Client
-	CK        *cloudkit.Client     // optional — nil = dry-run, decode + log only
-	Snapshots *mqtt.SnapshotCache  // optional — nil = no snapshot upload
-	Frigate   *frigate.Client      // optional — nil = no clip backfill
+	Relay     *relay.Client       // required in prod — nil = dry-run, decode + log only
+	Snapshots *mqtt.SnapshotCache // optional — Phase 2.5 will use this once asset upload via the Worker is wired
+	Frigate   *frigate.Client     // optional — Phase 2.5 clip backfill
 	Logger    *slog.Logger
 }
 
 type Coordinator struct {
 	mqtt      *mqtt.Client
-	ck        *cloudkit.Client
+	relay     *relay.Client
 	snapshots *mqtt.SnapshotCache
 	frigate   *frigate.Client
 	logger    *slog.Logger
 
-	receivedCount  atomic.Int64
-	forwardedCount atomic.Int64
-	skippedCount   atomic.Int64
-	errorCount     atomic.Int64
+	receivedCount   atomic.Int64
+	forwardedCount  atomic.Int64
+	skippedCount    atomic.Int64
+	errorCount      atomic.Int64
 	snapshotUploads atomic.Int64
 	clipUploads     atomic.Int64
 }
@@ -44,7 +51,7 @@ func New(opts Options) *Coordinator {
 	}
 	return &Coordinator{
 		mqtt:      opts.MQTT,
-		ck:        opts.CK,
+		relay:     opts.Relay,
 		snapshots: opts.Snapshots,
 		frigate:   opts.Frigate,
 		logger:    logger.With("component", "bridge"),
@@ -52,12 +59,12 @@ func New(opts Options) *Coordinator {
 }
 
 // Run blocks until ctx is done. It connects MQTT, subscribes, and forwards
-// every decoded event to CloudKit (when ck != nil). Errors during
+// every decoded event to the relay (when relay != nil). Errors during
 // forwarding are logged but don't terminate the loop — the bridge is
-// designed to keep running through transient broker / CloudKit hiccups.
+// designed to keep running through transient broker / relay hiccups.
 func (c *Coordinator) Run(ctx context.Context) error {
 	c.logger.Info("starting bridge",
-		"dry_run", c.ck == nil,
+		"dry_run", c.relay == nil,
 		"snapshots_enabled", c.snapshots != nil,
 		"clips_enabled", c.frigate != nil)
 	if err := c.mqtt.Connect(ctx, c.handleEvent); err != nil {
@@ -114,7 +121,7 @@ func (c *Coordinator) handleEvent(ctx context.Context, ev mqtt.Event) {
 }
 
 func (c *Coordinator) handleNewEvent(ctx context.Context, ev mqtt.Event) {
-	if c.ck == nil {
+	if c.relay == nil {
 		c.skippedCount.Add(1)
 		c.logger.Info("[dry-run] would forward",
 			"id", ev.ID,
@@ -125,34 +132,21 @@ func (c *Coordinator) handleNewEvent(ctx context.Context, ev mqtt.Event) {
 		return
 	}
 
-	rec := cloudkit.FrigateEvent{
-		ID:        ev.ID,
-		Camera:    ev.Camera,
-		Label:     ev.Label,
-		Zones:     ev.Zones,
-		TopScore:  ev.TopScore,
-		StartTime: ev.StartTime,
-	}
-
-	// Snapshot upload first — if the upload fails, log and continue
-	// without it (the record is more important than the preview image).
-	if c.snapshots != nil && ev.HasSnapshot {
-		if jpeg := c.snapshots.Latest(ev.Camera, ev.Label); len(jpeg) > 0 {
-			receipt, err := c.ck.UploadAsset(ctx, cloudkit.DBPrivate,
-				"FrigateEvent", ev.ID, "snapshot", jpeg)
-			if err != nil {
-				c.logger.Warn("snapshot upload failed",
-					"id", ev.ID, "size", len(jpeg), "err", err)
-			} else {
-				rec.Snapshot = receipt
-				c.snapshotUploads.Add(1)
-			}
-		}
-	}
-
-	if err := c.ck.SaveRecord(ctx, cloudkit.DBPrivate, rec.ToRecord()); err != nil {
+	// Phase 2: event metadata only. Snapshot upload via the Worker's
+	// signed-URL proxy lands in Phase 2.5; the iOS notification will
+	// surface the event without a thumbnail until that ships, which is
+	// strictly better than the current 100% 401 error rate.
+	resp, err := c.relay.PostEvent(ctx, relay.Event{
+		ID:         ev.ID,
+		Camera:     ev.Camera,
+		Label:      ev.Label,
+		DetectedAt: ev.StartTime.UnixMilli(),
+		TopScore:   ev.TopScore,
+		Zones:      ev.Zones,
+	})
+	if err != nil {
 		c.errorCount.Add(1)
-		c.logger.Warn("forward to CloudKit failed", "id", ev.ID, "err", err)
+		c.logger.Warn("forward to relay failed", "id", ev.ID, "err", err)
 		return
 	}
 	c.forwardedCount.Add(1)
@@ -161,54 +155,19 @@ func (c *Coordinator) handleNewEvent(ctx context.Context, ev mqtt.Event) {
 		"camera", ev.Camera,
 		"label", ev.Label,
 		"score", ev.TopScore,
-		"snapshot", rec.Snapshot != nil)
+		"recordName", resp.RecordName)
 }
 
 func (c *Coordinator) handleEndEvent(ctx context.Context, ev mqtt.Event) {
-	// Clip backfill: only if Frigate said it kept a clip AND we have an
-	// HTTP client to fetch it AND we have CK to upload to.
-	if c.frigate == nil || c.ck == nil || !ev.HasClip {
+	// Phase 2: clip backfill is wired to the dead CloudKit asset path
+	// and disabled until Phase 2.5 ports it to the Worker's signed-URL
+	// proxy. The "end" phase still counts in /metrics so we can see
+	// how often it would have run.
+	if !ev.HasClip {
 		c.skippedCount.Add(1)
 		return
 	}
-	clip, err := c.frigate.FetchClip(ctx, ev.ID)
-	if err != nil {
-		c.errorCount.Add(1)
-		c.logger.Warn("fetch clip failed", "id", ev.ID, "err", err)
-		return
-	}
-	if len(clip) == 0 {
-		// 404 from Frigate — event existed but no MP4 on disk. Counted
-		// as skipped so we still see the event volume in metrics.
-		c.skippedCount.Add(1)
-		return
-	}
-	receipt, err := c.ck.UploadAsset(ctx, cloudkit.DBPrivate,
-		"FrigateEvent", ev.ID, "clip", clip)
-	if err != nil {
-		c.errorCount.Add(1)
-		c.logger.Warn("clip upload failed",
-			"id", ev.ID, "size", len(clip), "err", err)
-		return
-	}
-	// Patch the existing record with the new clip field. We don't have a
-	// dedicated PATCH path yet — re-saving the record with the clip
-	// attached relies on CloudKit's "forceUpdate" operation which merges.
-	rec := cloudkit.FrigateEvent{
-		ID:        ev.ID,
-		Camera:    ev.Camera,
-		Label:     ev.Label,
-		Zones:     ev.Zones,
-		TopScore:  ev.TopScore,
-		StartTime: ev.StartTime,
-		Clip:      receipt,
-	}
-	if err := c.ck.SaveRecord(ctx, cloudkit.DBPrivate, rec.ToRecord()); err != nil {
-		c.errorCount.Add(1)
-		c.logger.Warn("clip-attach SaveRecord failed", "id", ev.ID, "err", err)
-		return
-	}
-	c.clipUploads.Add(1)
-	c.logger.Info("clip attached",
-		"id", ev.ID, "size", len(clip), "camera", ev.Camera)
+	c.skippedCount.Add(1)
+	c.logger.Debug("clip backfill deferred to Phase 2.5",
+		"id", ev.ID, "camera", ev.Camera)
 }

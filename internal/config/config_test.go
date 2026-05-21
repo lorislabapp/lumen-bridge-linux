@@ -86,15 +86,14 @@ func TestValidate_RequiresMQTTHost(t *testing.T) {
 	}
 }
 
-func TestValidate_RejectsBadEnvironment(t *testing.T) {
-	resetEnv(t)
-	t.Setenv("LB_MQTT_HOST", "broker.lan")
-	t.Setenv("LB_CK_ENVIRONMENT", "staging") // not allowed
-	_, err := Load("")
-	if err == nil {
-		t.Fatal("expected error for invalid environment")
-	}
-}
+// Note: validation of `cloudkit.environment` was dropped in v0.3.0 when
+// the daemon stopped talking to CloudKit directly. The Relay Worker
+// owns environment selection (it knows which container/env to sign for),
+// and the cloudkit.* config fields remain only for legacy file
+// compatibility — they don't gate startup anymore.
+//
+// What we DO still validate strictly: relay.url and relay.device_token_path
+// (see config.go validate()). Add tests for those when changing defaults.
 
 // resetEnv clears every LB_* env var so tests start from a clean baseline.
 // `t.Setenv` restores per-call but doesn't unset variables set by the
