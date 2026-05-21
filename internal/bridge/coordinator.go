@@ -132,10 +132,19 @@ func (c *Coordinator) handleNewEvent(ctx context.Context, ev mqtt.Event) {
 		return
 	}
 
-	// Phase 2: event metadata only. Snapshot upload via the Worker's
-	// signed-URL proxy lands in Phase 2.5; the iOS notification will
-	// surface the event without a thumbnail until that ships, which is
-	// strictly better than the current 100% 401 error rate.
+	// Phase 2.5: try to attach a snapshot. The snapshot cache is keyed
+	// on (camera, label) and is populated by retained MQTT messages on
+	// frigate/{camera}/{label}/snapshot. If no snapshot is cached yet
+	// (cold start, label mismatch), we ship the record metadata-only
+	// rather than block the event entirely — iOS still gets the
+	// notification, just without the thumbnail.
+	var snapshot *relay.AssetReceipt
+	if c.snapshots != nil {
+		if jpeg := c.snapshots.Latest(ev.Camera, ev.Label); len(jpeg) > 0 {
+			snapshot = c.uploadSnapshot(ctx, ev, jpeg)
+		}
+	}
+
 	resp, err := c.relay.PostEvent(ctx, relay.Event{
 		ID:         ev.ID,
 		Camera:     ev.Camera,
@@ -143,7 +152,7 @@ func (c *Coordinator) handleNewEvent(ctx context.Context, ev mqtt.Event) {
 		DetectedAt: ev.StartTime.UnixMilli(),
 		TopScore:   ev.TopScore,
 		Zones:      ev.Zones,
-	})
+	}, snapshot)
 	if err != nil {
 		c.errorCount.Add(1)
 		c.logger.Warn("forward to relay failed", "id", ev.ID, "err", err)
@@ -155,19 +164,92 @@ func (c *Coordinator) handleNewEvent(ctx context.Context, ev mqtt.Event) {
 		"camera", ev.Camera,
 		"label", ev.Label,
 		"score", ev.TopScore,
-		"recordName", resp.RecordName)
+		"recordName", resp.RecordName,
+		"snapshot", snapshot != nil)
+}
+
+// uploadSnapshot does the two-step CloudKit asset dance (request URL
+// from Worker, PUT bytes to Apple CDN). Returns nil on any failure
+// because a missing snapshot is non-fatal — the event still ships
+// metadata-only.
+func (c *Coordinator) uploadSnapshot(ctx context.Context, ev mqtt.Event, jpeg []byte) *relay.AssetReceipt {
+	upload, err := c.relay.RequestAssetUpload(ctx, relay.AssetFieldSnapshot, ev.ID)
+	if err != nil {
+		c.logger.Warn("snapshot upload-url request failed",
+			"id", ev.ID, "camera", ev.Camera, "err", err)
+		return nil
+	}
+	receipt, err := c.relay.UploadAsset(ctx, upload.URL, jpeg, "image/jpeg")
+	if err != nil {
+		c.logger.Warn("snapshot PUT to cloudkit failed",
+			"id", ev.ID, "camera", ev.Camera, "bytes", len(jpeg), "err", err)
+		return nil
+	}
+	c.snapshotUploads.Add(1)
+	c.logger.Debug("snapshot uploaded",
+		"id", ev.ID, "camera", ev.Camera, "bytes", len(jpeg),
+		"receipt", truncateString(receipt.Receipt, 20))
+	return receipt
 }
 
 func (c *Coordinator) handleEndEvent(ctx context.Context, ev mqtt.Event) {
-	// Phase 2: clip backfill is wired to the dead CloudKit asset path
-	// and disabled until Phase 2.5 ports it to the Worker's signed-URL
-	// proxy. The "end" phase still counts in /metrics so we can see
-	// how often it would have run.
-	if !ev.HasClip {
+	// Frigate publishes "end" once the event is finalised and (when
+	// configured) the MP4 clip is written to disk. We try to fetch the
+	// clip from Frigate's HTTP API and backfill it onto the existing
+	// FrigateEvent record so the iOS clients can play it back in-app.
+	//
+	// Three preconditions: Frigate client configured, clip recorded,
+	// and the Bridge has a relay client (not dry-run).
+	if c.frigate == nil || !ev.HasClip || c.relay == nil {
 		c.skippedCount.Add(1)
 		return
 	}
-	c.skippedCount.Add(1)
-	c.logger.Debug("clip backfill deferred to Phase 2.5",
-		"id", ev.ID, "camera", ev.Camera)
+
+	mp4, err := c.frigate.FetchClip(ctx, ev.ID)
+	if err != nil {
+		c.errorCount.Add(1)
+		c.logger.Warn("clip fetch from frigate failed",
+			"id", ev.ID, "camera", ev.Camera, "err", err)
+		return
+	}
+	if len(mp4) == 0 {
+		// (nil, nil) from FetchClip = "Frigate skipped the recording".
+		// Not an error — just nothing to backfill.
+		c.skippedCount.Add(1)
+		c.logger.Debug("clip not on disk; skipping backfill",
+			"id", ev.ID, "camera", ev.Camera)
+		return
+	}
+
+	upload, err := c.relay.RequestAssetUpload(ctx, relay.AssetFieldClip, ev.ID)
+	if err != nil {
+		c.errorCount.Add(1)
+		c.logger.Warn("clip upload-url request failed",
+			"id", ev.ID, "camera", ev.Camera, "err", err)
+		return
+	}
+	receipt, err := c.relay.UploadAsset(ctx, upload.URL, mp4, "video/mp4")
+	if err != nil {
+		c.errorCount.Add(1)
+		c.logger.Warn("clip PUT to cloudkit failed",
+			"id", ev.ID, "camera", ev.Camera, "bytes", len(mp4), "err", err)
+		return
+	}
+	if err := c.relay.UpdateEventAsset(ctx, upload.RecordName, relay.AssetFieldClip, receipt); err != nil {
+		c.errorCount.Add(1)
+		c.logger.Warn("clip commit to record failed",
+			"id", ev.ID, "recordName", upload.RecordName, "err", err)
+		return
+	}
+	c.clipUploads.Add(1)
+	c.logger.Info("clip backfilled",
+		"id", ev.ID, "camera", ev.Camera, "bytes", len(mp4),
+		"recordName", upload.RecordName)
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
