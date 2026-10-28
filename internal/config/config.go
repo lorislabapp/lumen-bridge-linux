@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -53,10 +54,10 @@ type FrigateConfig struct {
 }
 
 type CloudKitConfig struct {
-	Container      string `yaml:"container"`
-	Environment    string `yaml:"environment"`
-	APITokenPath   string `yaml:"api_token_path"`
-	UserTokenPath  string `yaml:"user_token_path"`
+	Container     string `yaml:"container"`
+	Environment   string `yaml:"environment"`
+	APITokenPath  string `yaml:"api_token_path"`
+	UserTokenPath string `yaml:"user_token_path"`
 }
 
 // Load resolves a config from `path` (or the standard search locations when
@@ -79,11 +80,34 @@ func Load(path string) (*Config, error) {
 	}
 
 	overlayEnv(cfg)
+	cfg.Relay.DeviceTokenPath = ExpandHome(cfg.Relay.DeviceTokenPath)
+	cfg.Relay.URL = strings.TrimRight(cfg.Relay.URL, "/")
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// DefaultRelayURL is the production Lumen Bridge Relay Worker.
+const DefaultRelayURL = "https://relay.lorislab.fr"
+
+// DefaultDeviceTokenPath is ~/.config/lumen-bridge/device-token.json.
+func DefaultDeviceTokenPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "lumen-bridge", "device-token.json")
+}
+
+// ExpandHome turns a leading "~/" into the current user's home dir.
+// YAML values are not shell-expanded, so without this a literal "~"
+// directory would be used.
+func ExpandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	return p
 }
 
 func defaults() *Config {
@@ -95,8 +119,8 @@ func defaults() *Config {
 			ClientID:    "lumen-bridge-linux",
 		},
 		Relay: RelayConfig{
-			URL:             "https://relay.lorislab.fr",
-			DeviceTokenPath: filepath.Join(home, ".config", "lumen-bridge", "device-token.json"),
+			URL:             DefaultRelayURL,
+			DeviceTokenPath: DefaultDeviceTokenPath(),
 		},
 		CloudKit: CloudKitConfig{
 			Container:     "iCloud.com.lorislabapp.lumenbridge",

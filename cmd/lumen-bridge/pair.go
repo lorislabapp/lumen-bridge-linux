@@ -17,47 +17,101 @@ import (
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/hkdf"
+
+	"github.com/lorislabapp/lumen-bridge-linux/internal/config"
 )
 
 func pairCmd(args []string) {
 	fs := flag.NewFlagSet("pair", flag.ExitOnError)
-	code := fs.String("code", "", "6-digit pairing code from app (required)")
-	relayURL := fs.String("relay", "wss://relay.lorislab.fr", "Relay server URL (default points to the production Lumen Bridge Relay)")
-	fs.Parse(args)
+	code := fs.String("code", "", "6-digit pairing code shown by the Lumen app (required)")
+	relayURL := fs.String("relay", "", "relay URL (default: relay.url from config, else https://relay.lorislab.fr)")
+	cfgPath := fs.String("config", "", "config.yaml to read relay.url and relay.device_token_path from")
+	tokenPath := fs.String("token-path", "", "where to write the device token (default: relay.device_token_path)")
+	_ = fs.Parse(args)
 
 	if *code == "" {
 		fmt.Fprintln(os.Stderr, "Error: --code flag is required")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Usage: lumen-bridge pair --code <6-digit-code>")
+		fmt.Fprintln(os.Stderr, "Usage: lumen-bridge pair --code <6-digit-code> [--config PATH] [--token-path PATH]")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Pair this Bridge with your Lumen app to receive CloudKit credentials.")
-		fmt.Fprintln(os.Stderr, "The app will display a 6-digit pairing code.")
+		fmt.Fprintln(os.Stderr, "In the Lumen app: Settings → Paired Bridges → Pair a Bridge shows the code.")
 		os.Exit(1)
 	}
-
-	if len(*code) != 6 {
+	if !isSixDigits(*code) {
 		fmt.Fprintln(os.Stderr, "Error: pairing code must be exactly 6 digits")
 		os.Exit(1)
 	}
 
-	if err := runPairing(*code, *relayURL); err != nil {
+	// Resolve relay URL + token path: flag > config/env > defaults.
+	// A config that fails validation (e.g. mqtt.host not filled in yet)
+	// must not block pairing, so fall back to defaults + env.
+	resolvedRelay := config.DefaultRelayURL
+	resolvedToken := config.DefaultDeviceTokenPath()
+	if cfg, err := config.Load(*cfgPath); err == nil {
+		resolvedRelay = cfg.Relay.URL
+		resolvedToken = cfg.Relay.DeviceTokenPath
+	} else {
+		if v := os.Getenv("LB_RELAY_URL"); v != "" {
+			resolvedRelay = v
+		}
+		if v := os.Getenv("LB_RELAY_DEVICE_TOKEN_PATH"); v != "" {
+			resolvedToken = config.ExpandHome(v)
+		}
+	}
+	if *relayURL != "" {
+		resolvedRelay = *relayURL
+	}
+	if *tokenPath != "" {
+		resolvedToken = config.ExpandHome(*tokenPath)
+	}
+
+	if err := runPairing(*code, resolvedRelay, resolvedToken); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func runPairing(code string, relayBaseURL string) error {
-	// Build WebSocket URL
-	wsURL, err := url.Parse(relayBaseURL)
-	if err != nil {
-		return fmt.Errorf("invalid relay URL: %w", err)
+func isSixDigits(s string) bool {
+	if len(s) != 6 {
+		return false
 	}
-	wsURL.Path = fmt.Sprintf("/pair/ws/%s", code)
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// pairingWebSocketURL turns the relay base URL (https://… or wss://…)
+// into the pairing WebSocket endpoint for a code.
+func pairingWebSocketURL(relayBaseURL, code string) (string, error) {
+	u, err := url.Parse(relayBaseURL)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid relay URL %q", relayBaseURL)
+	}
+	switch u.Scheme {
+	case "https", "wss":
+		u.Scheme = "wss"
+	case "http", "ws":
+		u.Scheme = "ws"
+	default:
+		return "", fmt.Errorf("unsupported relay URL scheme %q", u.Scheme)
+	}
+	u.Path = "/pair/ws/" + code
+	u.RawQuery = ""
+	return u.String(), nil
+}
+
+func runPairing(code, relayBaseURL, tokenPath string) error {
+	wsURL, err := pairingWebSocketURL(relayBaseURL, code)
+	if err != nil {
+		return err
+	}
 
 	fmt.Printf("🔗 Connecting to relay...\n")
 
-	// Connect to relay WebSocket
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL.String(), nil)
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect to relay: %w\nMake sure the pairing code is correct and not expired", err)
 	}
@@ -96,7 +150,7 @@ func runPairing(code string, relayBaseURL string) error {
 			}
 
 			// Save to config file
-			if err := savePairingToken(token); err != nil {
+			if err := savePairingToken(token, tokenPath); err != nil {
 				return fmt.Errorf("failed to save token: %w", err)
 			}
 
@@ -107,7 +161,7 @@ func runPairing(code string, relayBaseURL string) error {
 				fmt.Printf("⚠️  Warning: failed to confirm to relay: %v\n", err)
 			}
 
-			fmt.Printf("\n✅ Device token received and saved to ~/.config/lumen-bridge/device-token.json\n")
+			fmt.Printf("\n✅ Device token received and saved to %s\n", tokenPath)
 			fmt.Printf("✅ Bridge is ready\n\n")
 			fmt.Printf("Next steps:\n")
 			fmt.Printf("  1. Restart the bridge: systemctl restart lumen-bridge\n")
@@ -174,17 +228,17 @@ func decryptPairingToken(encryptedB64 string, code string) (string, error) {
 // `relay.LoadDeviceToken` reads it back unmodified.
 //
 // Envelope shape we expect after decryption:
-//   { "token": "<base64url>", "id": "<uuid>", "user_ref": "lumen-user-...", "scope": "bridge" }
+//
+//	{ "token": "<base64url>", "id": "<uuid>", "user_ref": "lumen-user-...", "scope": "bridge" }
 //
 // If the payload is a bare string (older app builds), we wrap it
 // ourselves with sensible defaults so the bridge still starts.
-func savePairingToken(payload string) error {
-	configDir := filepath.Join(os.Getenv("HOME"), ".config", "lumen-bridge")
-	if configDir == "/.config/lumen-bridge" {
-		configDir = "/root/.config/lumen-bridge"
+func savePairingToken(payload, tokenFile string) error {
+	if tokenFile == "" {
+		return fmt.Errorf("no token path")
 	}
-	if err := os.MkdirAll(configDir, 0o700); err != nil {
-		return fmt.Errorf("failed to create config dir: %w", err)
+	if err := os.MkdirAll(filepath.Dir(tokenFile), 0o700); err != nil {
+		return fmt.Errorf("failed to create token dir: %w", err)
 	}
 
 	type envelope struct {
@@ -213,9 +267,6 @@ func savePairingToken(payload string) error {
 		return fmt.Errorf("marshal envelope: %w", err)
 	}
 
-	// New file path matches the relay config default; legacy
-	// token.json is left alone in case the operator wants to roll back.
-	tokenFile := filepath.Join(configDir, "device-token.json")
 	if err := os.WriteFile(tokenFile, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write token file: %w", err)
 	}

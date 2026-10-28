@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- build stage ----
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
@@ -24,12 +24,16 @@ RUN go build -trimpath -ldflags='-s -w' \
 # (TCP) and HTTPS. CA roots are bundled by distroless.
 FROM gcr.io/distroless/static-debian12:nonroot
 
-# /data is the canonical mount point — config.yaml + token cache live here
+# /data is the canonical mount point — config.yaml + device token live here
 # so the user can persist them across container recreates with one volume.
 VOLUME ["/data"]
 WORKDIR /data
 
 COPY --from=build /out/lumen-bridge /usr/local/bin/lumen-bridge
+
+# Keep the device token from `lumen-bridge pair` on the /data volume
+# (the nonroot user's home is not persisted).
+ENV LB_RELAY_DEVICE_TOKEN_PATH=/data/device-token.json
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/lumen-bridge"]

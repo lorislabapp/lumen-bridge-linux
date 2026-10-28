@@ -1,152 +1,175 @@
 # Lumen Bridge for Linux
 
-**A headless daemon that bridges [Frigate NVR](https://github.com/blakeblackshear/frigate) detection events to Apple's push infrastructure via the user's own iCloud — without any third-party server in between.**
+A small headless daemon that sends [Frigate NVR](https://github.com/blakeblackshear/frigate)
+detections to the **Lumen for Frigate** apps (iPhone, iPad, Mac, Apple Watch,
+Vision Pro). It is the Linux/Docker companion of
+[Lumen Bridge for macOS](https://github.com/lorislabapp/lumen-bridge): run it
+next to Frigate on your NAS, Pi, Unraid or Proxmox box instead of keeping a
+Mac on.
 
-The Linux companion to [Lumen Bridge for macOS](https://github.com/lorislabapp/lumen-bridge). Same role, same architecture, different host: where the macOS Bridge runs on a Mac in your menu bar, the Linux Bridge runs as a Docker container or systemd service alongside Frigate itself, on the same NAS / Pi / Synology / Unraid box.
-
-> **Status: early skeleton (2026-04-27).** Compiles, loads config, connects to Frigate's MQTT broker, decodes events. CloudKit write path is stubbed; the next milestone is end-to-end with Apple's CloudKit Web Services REST API.
-
-## Why Linux Bridge exists
-
-Most Frigate users run Frigate in Docker, on Linux. Asking them to also run a Mac 24/7 just to forward events to iCloud is friction. Linux Bridge removes that constraint:
-
-```
-Frigate (Docker, on your NAS)
-    │
-    │  MQTT (frigate/events, LAN only)
-    ▼
-Lumen Bridge for Linux  (this daemon, same NAS)
-    │
-    │  CloudKit Web Services REST   →   user's iCloud private database
-    ▼
-Apple CloudKit + APNs
-    │
-    │  silent push via CKQuerySubscription
-    ▼
-iPhone + iPad + Mac + Apple Watch (cellular) + Vision Pro
-```
-
-No Cloudflare. No Docker push relay. No third-party cloud. Detection events stay between your local network, Apple's CloudKit (private database scoped to *your* Apple ID), and your Apple devices.
+> **Status: v0.3.0.** MQTT decoding, relay forwarding, snapshot and clip
+> upload are implemented and unit-tested against the relay's API contract.
+> Not yet validated end-to-end on a real Frigate + iPhone setup by the
+> maintainers — please report problems in
+> [Issues](https://github.com/lorislabapp/lumen-bridge-linux/issues).
 
 ## How it works
 
-The Linux Bridge writes records of type `FrigateEvent` to the CloudKit container `iCloud.com.lorislabapp.lumenbridge` — the same container the macOS Bridge writes to and the same one the iOS / iPadOS / watchOS / visionOS Lumen for Frigate clients subscribe to via `CKQuerySubscription`. Result: a single `lumen-bridge-linux` daemon plus any Lumen client gives you camera notifications across every device under your Apple ID, with zero infrastructure in the middle.
-
-Record schema (mirrors the macOS Bridge):
-
-| Field         | Type     | Source                              |
-|---------------|----------|-------------------------------------|
-| `recordName`  | string   | Frigate event ID                    |
-| `camera`      | String   | Frigate camera name                 |
-| `label`       | String   | Detection label (`person`, `car`)   |
-| `zones`       | [String] | Frigate zones triggered             |
-| `topScore`    | Double   | Highest confidence score            |
-| `detectedAt`  | Date     | Frigate `start_time`                |
-| `snapshot`    | CKAsset  | JPEG snapshot (optional)            |
-| `clip`        | CKAsset  | Finalised MP4 clip (optional)       |
-
-## Authentication model
-
-Linux Bridge uses **CloudKit Web Services** (Apple's REST API), not the native `CloudKit.framework`. Two credentials are needed:
-
-1. **Container API token** — identifies the *container* (`iCloud.com.lorislabapp.lumenbridge`). One token per container, generated in [CloudKit Dashboard](https://icloud.developer.apple.com/dashboard/) by the LorisLabs developer account. Distributed with the binary; not user-secret.
-
-2. **User token** — identifies *which user's iCloud private database* to write to. Each user gets their own at first-run via Apple's iCloud sign-in web flow:
-
 ```
-$ lumen-bridge auth
-Open this URL in a browser to sign in to iCloud:
-    https://api.apple-cloudkit.com/auth/sign-in?ckSession=...
-Waiting for sign-in… (token saved to ~/.config/lumen-bridge/token.json)
-✓ Authenticated as <apple-id>
+Frigate ──MQTT (LAN)──▶ lumen-bridge ──HTTPS──▶ Lumen Bridge Relay ──▶ CloudKit ──▶ Lumen apps
+   ▲                        │                    (Cloudflare Worker)
+   └── HTTP :5000 (LAN) ────┘  snapshot / clip
 ```
 
-Tokens persist locally (`~/.config/lumen-bridge/token.json`, file mode 0600) and refresh automatically.
+1. The bridge subscribes to `frigate/events` on your MQTT broker.
+2. On a `new` detection it uploads the event snapshot and sends the event to
+   the relay. The relay writes a `FrigateEvent` record to CloudKit; the Lumen
+   apps receive it through their CloudKit subscription.
+3. On `end` it uploads the recorded MP4 clip and attaches it to the same record.
+4. `update` messages are ignored (the record already exists).
 
-## Quick start (Docker)
+The bridge holds no Apple credentials. It authenticates to the relay with a
+device token you create by pairing it with the Lumen app. You can revoke it
+any time from the app.
+
+## Requirements
+
+- Frigate 0.13+ with MQTT enabled (decoding tested against Frigate 0.17 payloads).
+- Network access from the bridge to your MQTT broker, and (recommended) to
+  Frigate's internal API on port 5000.
+- Outbound HTTPS to `relay.lorislab.fr` and Apple's CloudKit asset CDN.
+- The Lumen for Frigate app with push delivery set to **Apple Bridge**.
+
+## Install — Docker
 
 ```bash
-mkdir -p ~/lumen-bridge && cd ~/lumen-bridge
-cat > config.yaml <<'EOF'
-mqtt:
-  host: 192.168.3.160
-  port: 1883
-  username: frigate
-  password: <YOUR_EMQX_PASSWORD>
-cloudkit:
-  container: iCloud.com.lorislabapp.lumenbridge
-  environment: production
-EOF
+mkdir -p lumen-bridge
+curl -fsSL -o lumen-bridge/config.yaml \
+  https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/config.example.yaml
+$EDITOR lumen-bridge/config.yaml            # mqtt.host, credentials, frigate.base_url
+sudo chown -R 65532:65532 lumen-bridge      # image runs as distroless "nonroot"
 
-# First-time auth (interactive; opens a sign-in URL you copy to a browser)
-docker run --rm -it -v $PWD:/data ghcr.io/lorislabapp/lumen-bridge-linux auth
+# 1. Check the config
+docker run --rm -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.0 \
+  doctor --config /data/config.yaml
 
-# Run the daemon
-docker run -d \
-  --name lumen-bridge \
-  --restart unless-stopped \
-  -v $PWD:/data \
-  ghcr.io/lorislabapp/lumen-bridge-linux run
+# 2. Pair (code from the Lumen app, see "Pairing" below)
+docker run --rm -it -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.0 \
+  pair --config /data/config.yaml --code 123456
+
+# 3. Run
+docker run -d --name lumen-bridge --restart unless-stopped \
+  -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.0
 ```
 
-## Quick start (systemd, native binary)
+The image is multi-arch (amd64, arm64). A compose snippet is in
+[`docker-compose.example.yml`](docker-compose.example.yml).
+
+## Install — systemd (Debian / Ubuntu / Raspberry Pi OS)
 
 ```bash
-sudo install -m 0755 lumen-bridge /usr/local/bin/
-sudo install -m 0644 systemd/lumen-bridge.service /etc/systemd/system/
-sudo mkdir -p /etc/lumen-bridge && sudo install -m 0600 config.yaml /etc/lumen-bridge/config.yaml
-sudo -u lumen-bridge lumen-bridge auth   # one-time
-sudo systemctl daemon-reload
-sudo systemctl enable --now lumen-bridge.service
+curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh \
+  | sudo LB_VERSION=v0.3.0 bash
 ```
 
-## Configuration reference
+The script creates a `lumen-bridge` system user, installs the binary to
+`/usr/local/bin`, verifies it against the release `SHA256SUMS`, writes
+`/etc/lumen-bridge/config.yaml` (first install only) and a hardened systemd
+unit. Then:
 
-`config.yaml` (also overridable via env vars `LB_*`):
-
-```yaml
-mqtt:
-  host: <broker-host>             # required (LB_MQTT_HOST)
-  port: 1883                      # default 1883 (LB_MQTT_PORT)
-  username: <broker-username>     # optional (LB_MQTT_USERNAME)
-  password: <broker-password>     # optional (LB_MQTT_PASSWORD)
-  topic_prefix: frigate           # default "frigate" (LB_MQTT_TOPIC_PREFIX)
-  client_id: lumen-bridge-linux   # default (LB_MQTT_CLIENT_ID)
-
-cloudkit:
-  container: iCloud.com.lorislabapp.lumenbridge
-  environment: production         # production | development
-  api_token_path: /etc/lumen-bridge/api.token   # optional, defaults bundled
-  user_token_path: ~/.config/lumen-bridge/token.json
+```bash
+sudo $EDITOR /etc/lumen-bridge/config.yaml
+sudo -u lumen-bridge lumen-bridge doctor --config /etc/lumen-bridge/config.yaml
+sudo -u lumen-bridge lumen-bridge pair --config /etc/lumen-bridge/config.yaml --code 123456
+sudo systemctl enable --now lumen-bridge
+journalctl -fu lumen-bridge
 ```
+
+Manual install: download `lumen-bridge-linux-<arch>.tar.gz` and `SHA256SUMS`
+from [Releases](https://github.com/lorislabapp/lumen-bridge-linux/releases),
+run `sha256sum -c SHA256SUMS --ignore-missing`, and use
+[`systemd/lumen-bridge.service`](systemd/lumen-bridge.service).
+
+## Pairing with the Lumen app
+
+1. In Lumen: **Settings → Paired Bridges** (shown when push delivery is
+   *Apple Bridge*) **→ Pair a new Bridge**. The app shows a 6-digit code,
+   valid 5 minutes.
+2. On the bridge host run `lumen-bridge pair --code <code>` (with `--config`
+   as above). It waits for the app.
+3. In the app, name the bridge and confirm. The token is sent encrypted
+   with a key derived from the code (HKDF-SHA256 + AES-GCM) and saved to
+   `relay.device_token_path` with mode 0600.
+4. Start or restart the daemon. To unpair, revoke the bridge in
+   **Paired Bridges**.
+
+## Configuration
+
+`./config.yaml` or `/etc/lumen-bridge/config.yaml` (or `--config PATH`).
+Every field can be set by environment variable; env wins over the file.
+See [`config.example.yaml`](config.example.yaml).
+
+| Key | Env | Default |
+|---|---|---|
+| `mqtt.host` (required) | `LB_MQTT_HOST` | — |
+| `mqtt.port` | `LB_MQTT_PORT` | `1883` |
+| `mqtt.tls` | `LB_MQTT_TLS` | `false` |
+| `mqtt.username` / `mqtt.password` | `LB_MQTT_USERNAME` / `LB_MQTT_PASSWORD` | empty |
+| `mqtt.topic_prefix` | `LB_MQTT_TOPIC_PREFIX` | `frigate` |
+| `mqtt.client_id` | `LB_MQTT_CLIENT_ID` | `lumen-bridge-linux` |
+| `frigate.base_url` (recommended) | `LB_FRIGATE_BASE_URL` | empty |
+| `relay.url` | `LB_RELAY_URL` | `https://relay.lorislab.fr` |
+| `relay.device_token_path` | `LB_RELAY_DEVICE_TOKEN_PATH` | `~/.config/lumen-bridge/device-token.json` |
+| — | `LB_RELAY_DEVICE_TOKEN` | token value instead of a file |
+| — | `LB_HEALTH_ADDR` | `127.0.0.1:9090` |
+
+`frigate.base_url` should be Frigate's internal API, e.g.
+`http://192.168.1.50:5000`. With Frigate authentication enabled, port 8971
+needs a login; port 5000 does not — keep it on your LAN. Without
+`base_url`, the bridge uses live MQTT snapshots only and uploads no clips.
+
+## Operations
+
+- `lumen-bridge run [--dry-run] [--debug]` — `--dry-run` decodes and logs
+  events without sending anything.
+- `lumen-bridge doctor` — checks config, broker reachability, device token,
+  relay and Frigate.
+- Health server (default `127.0.0.1:9090`): `/healthz`, `/readyz` (503 while
+  MQTT is disconnected), `/metrics` (JSON counters: received, forwarded,
+  skipped, dropped, errors, snapshot_uploads, clip_uploads).
+- Relay errors: network, 429 and 5xx are retried with backoff; 4xx are
+  logged and skipped (401 = token revoked → pair again).
+
+## Privacy — what leaves your network
+
+Sent to the Lumen Bridge Relay (a Cloudflare Worker run by LorisLabs), which
+stores it in the LorisLabs CloudKit container `iCloud.com.lorislabapp.lumenbridge`:
+
+- per event: Frigate event id, camera name, label (e.g. `person`), zone names,
+  top score, start time;
+- the event snapshot JPEG and, when available, the MP4 clip;
+- the device token, which identifies your pairing. Records are tagged with
+  your pairing's user reference.
+
+Never sent: MQTT credentials, broker or Frigate addresses, `sub_label`
+(recognised face or plate names), Frigate config, live streams or any other
+MQTT topic. The bridge opens no inbound port.
+
+## Not in this release
+
+- Zone-specific alerts (e.g. "mailbox"), HomeKit and the other options of
+  the macOS Bridge 1.1.
+- Alerts based on Frigate review items (`frigate/reviews`).
 
 ## Build from source
 
 ```bash
-git clone https://github.com/lorislabapp/lumen-bridge-linux
-cd lumen-bridge-linux
-go build -o lumen-bridge ./cmd/lumen-bridge
-./lumen-bridge --help
+go test -race ./...
+CGO_ENABLED=0 go build -trimpath -ldflags '-s -w' -o lumen-bridge ./cmd/lumen-bridge
 ```
 
-## Roadmap
-
-| Milestone | Status | Notes |
-|---|---|---|
-| **0.0.1** Project skeleton, MQTT decode, config loader   | ✅ shipped | this commit |
-| **0.1.0** CloudKit Web Services write path, end-to-end   | ⏳ next     | sign requests with ECDSA, write `FrigateEvent` |
-| **0.2.0** Apple ID web auth flow + token persistence     | ⏳          | replaces env-var token mode |
-| **0.3.0** Snapshot CKAsset upload                        | ⏳          | reuse macOS Bridge's snapshot caching logic |
-| **0.4.0** Clip MP4 backfill on `end` events              | ⏳          | mirrors `attachClip` in macOS Bridge |
-| **0.5.0** Multi-hub presence (announce ourselves to other Bridge instances) | ⏳ | matches the v0.2 macOS feature |
-| **1.0.0** Stable: Docker Hub release, Helm chart, signed binaries for arm64 + amd64 | ⏳ | distribution polish |
-
-## Companion projects
-
-- **[Lumen Bridge for macOS](https://github.com/lorislabapp/lumen-bridge)** — same daemon, native Swift, runs in the menu bar.
-- **[Lumen for Frigate (iOS / iPadOS / watchOS / visionOS)](https://apps.apple.com/app/id6760238729)** — the user-facing app that subscribes to the bridge's CloudKit records and renders the notifications. Required.
-- **[Frigate](https://github.com/blakeblackshear/frigate)** — the upstream NVR project that publishes the MQTT events.
+Requires the Go version in `go.mod`. History: [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Open source from day one. Contributions welcome.
+MIT — see [LICENSE](LICENSE).

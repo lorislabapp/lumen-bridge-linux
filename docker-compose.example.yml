@@ -1,25 +1,24 @@
 # Drop-in example for users who run Frigate via docker-compose. Add this
-# service alongside your existing `frigate` service so the bridge can
-# subscribe to its MQTT broker on the same Docker network.
+# service alongside your existing `frigate` service so the bridge can reach
+# the same MQTT broker.
+#
+# One-time setup (see README):
+#   mkdir lumen-bridge && cp config.example.yaml lumen-bridge/config.yaml
+#   sudo chown -R 65532:65532 lumen-bridge     # distroless "nonroot" user
+#   docker compose run --rm lumen-bridge pair --code <6-digit code from Lumen>
 
 services:
   lumen-bridge:
     image: ghcr.io/lorislabapp/lumen-bridge-linux:latest
     container_name: lumen-bridge
     restart: unless-stopped
-
-    # Mount a host directory so config.yaml + the cached user token survive
-    # container recreates. Set strict perms on the host (`chmod 700`).
+    # config.yaml + device-token.json live here and survive re-creates.
     volumes:
       - ./lumen-bridge:/data
-
-    # Until the v0.2.0 web auth flow ships, both tokens are passed via env.
-    # Generate them once via the CloudKit Dashboard + iCloud sign-in flow,
-    # then paste them here. Treat them as secrets — they grant write access
-    # to your iCloud private database.
-    environment:
-      LB_CK_API_TOKEN: ${LUMEN_CK_API_TOKEN:?set in .env}
-      LB_CK_USER_TOKEN: ${LUMEN_CK_USER_TOKEN:?set in .env}
-
-    # The bridge only talks outbound (MQTT to your broker, HTTPS to
-    # Apple). No inbound port required.
+    # Optional: expose /healthz, /readyz, /metrics on the host.
+    # environment:
+    #   LB_HEALTH_ADDR: 0.0.0.0:9090
+    # ports:
+    #   - "127.0.0.1:9090:9090"
+    # The bridge only talks outbound (MQTT + Frigate on your LAN, HTTPS
+    # to the relay and Apple's CloudKit CDN). No inbound port required.

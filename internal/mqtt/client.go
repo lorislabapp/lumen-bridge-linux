@@ -18,7 +18,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
+	"unicode"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
 )
@@ -28,16 +30,17 @@ import (
 // false-positive flags) — we ignore everything that doesn't end up on the
 // CKRecord schema.
 type Event struct {
-	ID        string    // Frigate event ID — also the CKRecord.ID.recordName
-	Camera    string
-	Label     string
-	Zones     []string
-	TopScore  float64
-	StartTime time.Time
-	EndTime   *time.Time // nil while the event is still active
-	HasClip   bool
+	ID          string // Frigate event ID — also the CKRecord.ID.recordName
+	Camera      string
+	Label       string
+	SubLabel    string // recognised face / plate name, "" when none
+	Zones       []string
+	TopScore    float64
+	StartTime   time.Time
+	EndTime     *time.Time // nil while the event is still active
+	HasClip     bool
 	HasSnapshot bool
-	Phase     EventPhase // new | update | end
+	Phase       EventPhase // new | update | end
 }
 
 type EventPhase string
@@ -178,24 +181,93 @@ func (c *Client) handleMessage(_ paho.Client, msg paho.Message) {
 // frigateEventEnvelope is the wire shape of the JSON Frigate publishes
 // to `frigate/events`. The schema is documented at
 // https://docs.frigate.video/integrations/mqtt — we only deserialise the
-// fields that map to our CKRecord schema.
+// fields the bridge forwards.
 type frigateEventEnvelope struct {
-	Type   string         `json:"type"` // "new" | "update" | "end"
-	Before *frigateState  `json:"before"`
-	After  *frigateState  `json:"after"`
+	Type   string        `json:"type"` // "new" | "update" | "end"
+	Before *frigateState `json:"before"`
+	After  *frigateState `json:"after"`
 }
 
 type frigateState struct {
-	ID          string   `json:"id"`
-	Camera      string   `json:"camera"`
-	Label       string   `json:"label"`
-	TopScore    float64  `json:"top_score"`
-	CurrentZones []string `json:"current_zones"`
-	EnteredZones []string `json:"entered_zones"`
-	StartTimeUnix float64 `json:"start_time"`
-	EndTimeUnix   *float64 `json:"end_time"`
-	HasClip       bool    `json:"has_clip"`
-	HasSnapshot   bool    `json:"has_snapshot"`
+	ID       string  `json:"id"`
+	Camera   string  `json:"camera"`
+	Label    string  `json:"label"`
+	TopScore float64 `json:"top_score"`
+	// Frigate's MQTT payload carries current_zones (live) and
+	// entered_zones (history). `zones` is the REST/legacy name; accept it
+	// too so a replayed REST payload still decodes.
+	Zones         []string         `json:"zones"`
+	CurrentZones  []string         `json:"current_zones"`
+	EnteredZones  []string         `json:"entered_zones"`
+	SubLabel      flexibleSubLabel `json:"sub_label"`
+	StartTimeUnix float64          `json:"start_time"`
+	EndTimeUnix   *float64         `json:"end_time"`
+	HasClip       bool             `json:"has_clip"`
+	HasSnapshot   bool             `json:"has_snapshot"`
+}
+
+// flexibleSubLabel accepts the two shapes Frigate uses for sub_label:
+// a plain string ("Kevin") or a [name, score] pair (["Kevin", 0.92]).
+// null or any other shape decodes to "" instead of failing the whole
+// event.
+type flexibleSubLabel struct {
+	Name string
+}
+
+func (f *flexibleSubLabel) UnmarshalJSON(b []byte) error {
+	f.Name = ""
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		f.Name = s
+		return nil
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(b, &arr); err == nil && len(arr) > 0 {
+		if err := json.Unmarshal(arr[0], &s); err == nil {
+			f.Name = s
+		}
+	}
+	return nil
+}
+
+// isValidName mirrors the macOS Bridge guard: non-empty, at most 128
+// bytes, letters/digits plus "-_.:". Frigate event ids, camera, label
+// and zone names fit inside that set; anything else is treated as a
+// malformed payload and dropped rather than forwarded.
+func isValidName(v string) bool {
+	if v == "" || len(v) > 128 {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case unicode.IsLetter(r), unicode.IsDigit(r), r == '-', r == '_', r == '.', r == ':':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// mergeZones returns zones ∪ entered_zones ∪ current_zones, de-duplicated
+// in first-seen order. entered_zones keeps the history (current_zones is
+// empty once the object has left); current_zones adds any zone entered
+// since the last entered_zones update.
+func mergeZones(lists ...[]string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, l := range lists {
+		for _, z := range l {
+			if !seen[z] {
+				seen[z] = true
+				out = append(out, z)
+			}
+		}
+	}
+	return out
+}
+
+func unixFloat(sec float64) time.Time {
+	return time.UnixMilli(int64(math.Round(sec * 1000))).UTC()
 }
 
 func (e frigateEventEnvelope) toEvent() (Event, bool) {
@@ -206,23 +278,33 @@ func (e frigateEventEnvelope) toEvent() (Event, bool) {
 	if state == nil || state.ID == "" {
 		return Event{}, false
 	}
-	zones := state.EnteredZones
-	if len(zones) == 0 {
-		zones = state.CurrentZones
+	zones := mergeZones(state.Zones, state.EnteredZones, state.CurrentZones)
+	if !isValidName(state.ID) || !isValidName(state.Camera) || !isValidName(state.Label) || len(zones) > 64 {
+		return Event{}, false
+	}
+	for _, z := range zones {
+		if !isValidName(z) {
+			return Event{}, false
+		}
+	}
+	if math.IsNaN(state.TopScore) || state.TopScore < 0 || state.TopScore > 1 ||
+		math.IsNaN(state.StartTimeUnix) || math.IsInf(state.StartTimeUnix, 0) {
+		return Event{}, false
 	}
 	out := Event{
-		ID:        state.ID,
-		Camera:    state.Camera,
-		Label:     state.Label,
-		Zones:     zones,
-		TopScore:  state.TopScore,
-		StartTime: time.Unix(int64(state.StartTimeUnix), 0).UTC(),
-		HasClip:   state.HasClip,
+		ID:          state.ID,
+		Camera:      state.Camera,
+		Label:       state.Label,
+		SubLabel:    state.SubLabel.Name,
+		Zones:       zones,
+		TopScore:    state.TopScore,
+		StartTime:   unixFloat(state.StartTimeUnix),
+		HasClip:     state.HasClip,
 		HasSnapshot: state.HasSnapshot,
-		Phase:     EventPhase(e.Type),
+		Phase:       EventPhase(e.Type),
 	}
 	if state.EndTimeUnix != nil {
-		t := time.Unix(int64(*state.EndTimeUnix), 0).UTC()
+		t := unixFloat(*state.EndTimeUnix)
 		out.EndTime = &t
 	}
 	return out, true

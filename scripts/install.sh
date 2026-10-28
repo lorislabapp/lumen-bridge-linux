@@ -8,10 +8,10 @@
 #
 # Or with a specific version:
 #
-#   LB_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh | LB_VERSION=v0.3.0 bash
 #
 # After install, edit /etc/lumen-bridge/config.yaml, then:
-#   sudo -u lumen-bridge LB_CK_API_TOKEN=<token> /usr/local/bin/lumen-bridge auth
+#   sudo -u lumen-bridge /usr/local/bin/lumen-bridge pair --config /etc/lumen-bridge/config.yaml --code <6-digit>
 #   systemctl enable --now lumen-bridge
 set -euo pipefail
 
@@ -19,7 +19,7 @@ set -euo pipefail
 # yet (e.g. /tmp/user/0). Force a known-good location so mktemp works.
 export TMPDIR=/tmp
 
-VERSION="${LB_VERSION:-v0.2.0}"
+VERSION="${LB_VERSION:-v0.3.0}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 case "$ARCH" in
   amd64|x86_64)  ARCH=amd64 ;;
@@ -32,7 +32,8 @@ BIN_PATH=/usr/local/bin/lumen-bridge
 CONF_DIR=/etc/lumen-bridge
 STATE_DIR=/var/lib/lumen-bridge
 TARBALL="lumen-bridge-linux-${ARCH}.tar.gz"
-URL="https://github.com/lorislabapp/lumen-bridge-linux/releases/download/${VERSION}/${TARBALL}"
+BASE_URL="https://github.com/lorislabapp/lumen-bridge-linux/releases/download/${VERSION}"
+URL="${BASE_URL}/${TARBALL}"
 
 echo ">>> Lumen Bridge for Linux installer (${VERSION} / ${ARCH})"
 
@@ -59,6 +60,13 @@ echo ">>> Downloading $URL"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL -o "$TMP/$TARBALL" "$URL"
+# Verify against the release's SHA256SUMS when the release publishes one
+# (v0.3.0+). Older releases have no checksum file.
+if curl -fsSL -o "$TMP/SHA256SUMS" "${BASE_URL}/SHA256SUMS" 2>/dev/null; then
+  (cd "$TMP" && grep " ${TARBALL}\$" SHA256SUMS | sha256sum -c -) \
+    || { echo "Checksum verification failed for $TARBALL" >&2; exit 1; }
+  echo ">>> Checksum OK"
+fi
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
 install -m 0755 "$TMP/lumen-bridge-linux-${ARCH}" "$BIN_PATH"
 echo ">>> Installed $($BIN_PATH version)"
@@ -76,12 +84,12 @@ mqtt:
   topic_prefix: frigate
   client_id: lumen-bridge-linux
 
-cloudkit:
-  container: iCloud.com.lorislabapp.lumenbridge
-  environment: production
+relay:
+  url: https://relay.lorislab.fr
+  device_token_path: /var/lib/lumen-bridge/device-token.json
 
 frigate:
-  base_url: http://192.168.1.50:5000   # optional — enables clip MP4 backfill
+  base_url: http://192.168.1.50:5000   # optional — per-event snapshot + clip upload
 YAML
   chmod 0640 "$CONF_DIR/config.yaml"
   chown "$USER_NAME:$USER_NAME" "$CONF_DIR/config.yaml"
@@ -90,7 +98,7 @@ fi
 # 6. systemd unit.
 cat > /etc/systemd/system/lumen-bridge.service <<'UNIT'
 [Unit]
-Description=Lumen Bridge — forwards Frigate detection events to iCloud CloudKit
+Description=Lumen Bridge — forwards Frigate detection events to the Lumen apps
 Documentation=https://github.com/lorislabapp/lumen-bridge-linux
 After=network-online.target
 Wants=network-online.target
@@ -134,21 +142,17 @@ cat <<'NEXT'
 ──────────────────────────────────────────────────────────────────────
 Install complete. Next steps:
 
-  1. Edit broker host + EMQX password:
+  1. Edit broker host + MQTT credentials (+ Frigate base_url):
        editor /etc/lumen-bridge/config.yaml
 
-  2. Smoke-test without CloudKit:
-       sudo -u lumen-bridge /usr/local/bin/lumen-bridge run --dry-run
+  2. Check config + broker reachability, then watch decoded events:
+       sudo -u lumen-bridge /usr/local/bin/lumen-bridge doctor --config /etc/lumen-bridge/config.yaml
+       sudo -u lumen-bridge /usr/local/bin/lumen-bridge run --config /etc/lumen-bridge/config.yaml --dry-run
 
-  3. Get a CloudKit Web Services token from the LorisLabs CloudKit
-     Dashboard for container `iCloud.com.lorislabapp.lumenbridge`,
-     then authenticate as the user:
-       sudo -u lumen-bridge LB_CK_API_TOKEN=<token> \
-         /usr/local/bin/lumen-bridge auth
-
-     The auth subcommand will print a URL — open it in any browser
-     to walk through Apple ID sign-in and copy the resulting ckSession
-     token back into the local paste form.
+  3. Pair with the Lumen app (Settings → Paired Bridges → Pair a Bridge
+     shows a 6-digit code), then on this host:
+       sudo -u lumen-bridge /usr/local/bin/lumen-bridge pair \
+         --config /etc/lumen-bridge/config.yaml --code <6-digit>
 
   4. Start the daemon:
        systemctl enable --now lumen-bridge

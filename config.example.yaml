@@ -22,17 +22,15 @@ relay:
   # Lumen Bridge Relay Worker. Don't change unless you're self-hosting
   # the relay against your own CloudKit container.
   url: https://relay.lorislab.fr
-  # Where the device token (obtained via `lumen-bridge pair --code <6-digit>`
-  # after generating a code in the Lumen iOS app) is cached. Defaults to
-  # ~/.config/lumen-bridge/device-token.json — set explicitly here if you
-  # run as a service user with a non-default home dir.
+  # Where `lumen-bridge pair --code <6-digit>` stores this bridge's device
+  # token (mode 0600). Default: ~/.config/lumen-bridge/device-token.json.
+  # systemd install: /var/lib/lumen-bridge/device-token.json
+  # Docker image:    /data/device-token.json (set by the image)
   device_token_path: ~/.config/lumen-bridge/device-token.json
 
-# Optional. Set to enable clip-MP4 backfill on event-end. Without this,
-# events still forward with their snapshot but the iOS clients won't see
-# the recorded video. Should point to your Frigate web UI host (port 5000
-# by default).
-# (Phase 2.5: clip backfill is currently a no-op pending the Worker's
-# signed-URL proxy. Snapshots are deferred to the same phase.)
+# Optional but recommended. Frigate's internal API (port 5000, LAN only).
+# Enables the exact per-event snapshot on "new" and the MP4 clip upload on
+# "end". Without it the bridge uses live MQTT snapshots only and no clips.
+# Frigate 0.14+ with auth enabled: use port 5000, not the 8971 login port.
 frigate:
   base_url: http://192.168.1.50:5000

@@ -1,12 +1,11 @@
 // Package frigate is a tiny HTTP client for Frigate's events API.
-// Used by the bridge to fetch the finalised MP4 clip after an `end`
-// event so it can be uploaded as a CKAsset on the FrigateEvent record.
+// Used by the bridge to fetch the event snapshot JPEG (at "new") and the
+// finalised MP4 clip (at "end") so they can be uploaded as CKAssets on
+// the FrigateEvent record.
 //
-// The mqtt package gives us snapshot bytes (Frigate publishes them
-// retained on `frigate/{camera}/{label}/snapshot`); the clip needs to
-// come from HTTP because Frigate doesn't republish the finalised MP4
-// over MQTT — the file lives on disk and is served from
-// `GET /api/events/{event_id}/clip.mp4`.
+// Point base_url at Frigate's internal port 5000. With Frigate 0.14+
+// authentication enabled, port 8971 requires a login; port 5000 is the
+// unauthenticated internal API and should only be reachable on your LAN.
 package frigate
 
 import (
@@ -14,6 +13,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -26,43 +27,53 @@ type Client struct {
 // as the MQTT broker on port 5000, e.g. http://frigate.local:5000.
 func New(baseURL string) *Client {
 	return &Client{
-		baseURL: baseURL,
-		// Clip fetches can take several seconds on slow disks / RTSP
-		// streams; the macOS bridge defaults to 60s. Match that.
+		baseURL: strings.TrimRight(baseURL, "/"),
+		// Clip fetches can take several seconds on slow disks; the
+		// macOS bridge defaults to 60s. Match that.
 		httpClient: &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
-// FetchClip downloads the finalised MP4 for an event. Returns the raw
-// bytes ready to hand to cloudkit.UploadAsset. Empty body + nil error is
-// returned when the clip simply doesn't exist (Frigate kept the event
-// metadata but skipped the recording — common for low-confidence events).
+// FetchClip downloads the finalised MP4 for an event. Empty body + nil
+// error is returned when the clip simply doesn't exist (Frigate kept the
+// event metadata but skipped the recording).
 func (c *Client) FetchClip(ctx context.Context, eventID string) ([]byte, error) {
+	return c.fetch(ctx, eventID, "clip.mp4", 50*1024*1024)
+}
+
+// FetchSnapshot downloads the event's current best snapshot JPEG. Frigate
+// serves it while the event is still in progress. (nil, nil) when Frigate
+// has no snapshot for the event (snapshots disabled for that camera).
+func (c *Client) FetchSnapshot(ctx context.Context, eventID string) ([]byte, error) {
+	return c.fetch(ctx, eventID, "snapshot.jpg", 10*1024*1024)
+}
+
+func (c *Client) fetch(ctx context.Context, eventID, file string, limit int64) ([]byte, error) {
 	if c.baseURL == "" {
 		return nil, fmt.Errorf("frigate base URL not configured")
 	}
-	url := fmt.Sprintf("%s/api/events/%s/clip.mp4", c.baseURL, eventID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	u := fmt.Sprintf("%s/api/events/%s/%s", c.baseURL, url.PathEscape(eventID), file)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch clip: %w", err)
+		return nil, fmt.Errorf("fetch %s: %w", file, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		// Event exists but no clip on disk — return (nil, nil) so the
-		// caller treats this as "no enrichment available" rather than
-		// a hard error.
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("fetch clip: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("fetch %s: HTTP %d", file, resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 50*1024*1024)) // 50 MB cap
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, fmt.Errorf("read clip body: %w", err)
+		return nil, fmt.Errorf("read %s body: %w", file, err)
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("fetch %s: larger than %d bytes", file, limit)
 	}
 	return body, nil
 }

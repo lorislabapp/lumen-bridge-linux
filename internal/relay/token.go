@@ -15,10 +15,10 @@ import (
 // metadata. The relay owns rotation; the daemon never refreshes the
 // token on its own.
 type StoredDeviceToken struct {
-	Token  string `json:"token"`
-	ID     string `json:"id,omitempty"`      // server-side row id (useful for self-revoke)
+	Token   string `json:"token"`
+	ID      string `json:"id,omitempty"`       // server-side row id (useful for self-revoke)
 	UserRef string `json:"user_ref,omitempty"` // useful for /metrics labels
-	Scope  string `json:"scope,omitempty"`   // expected: "bridge"
+	Scope   string `json:"scope,omitempty"`    // expected: "bridge"
 }
 
 // LoadDeviceToken reads a token file. Returns (nil, nil) when the file

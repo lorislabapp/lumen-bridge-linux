@@ -25,8 +25,12 @@ type SnapshotCache struct {
 }
 
 type snapshotEntry struct {
-	bytes  []byte
+	bytes    []byte
 	storedAt time.Time
+	// retained is true when the broker replayed the JPEG on subscribe.
+	// Its age is unknown (it may belong to an event from hours ago), so
+	// Fresh never returns it.
+	retained bool
 }
 
 func NewSnapshotCache(ttl time.Duration) *SnapshotCache {
@@ -50,18 +54,37 @@ func (s *SnapshotCache) Subscribe(client paho.Client, topicPrefix string) error 
 }
 
 func (s *SnapshotCache) handleMessage(_ paho.Client, msg paho.Message) {
-	parts := strings.Split(msg.Topic(), "/")
+	s.store(msg.Topic(), msg.Payload(), msg.Retained(), time.Now())
+}
+
+func (s *SnapshotCache) store(topic string, payload []byte, retained bool, now time.Time) {
+	parts := strings.Split(topic, "/")
 	// Expected: [topicPrefix, camera, label, "snapshot"] — at least 4 parts.
-	if len(parts) < 4 || parts[len(parts)-1] != "snapshot" {
+	if len(parts) < 4 || parts[len(parts)-1] != "snapshot" || len(payload) == 0 {
 		return
 	}
 	camera := parts[len(parts)-3]
 	label := parts[len(parts)-2]
 	key := camera + "|" + label
-	bytes := append([]byte(nil), msg.Payload()...) // copy — paho may reuse the buffer
+	bytes := append([]byte(nil), payload...) // copy — paho may reuse the buffer
 	s.mu.Lock()
-	s.entries[key] = snapshotEntry{bytes: bytes, storedAt: time.Now()}
+	s.entries[key] = snapshotEntry{bytes: bytes, storedAt: now, retained: retained}
 	s.mu.Unlock()
+}
+
+// Fresh returns the snapshot for (camera, label) only if it was received
+// live (not a retained replay) at or after `since`. This is what the
+// bridge attaches to a new event: a JPEG from a previous detection on
+// the same camera/label must never be shown as this event's thumbnail.
+func (s *SnapshotCache) Fresh(camera, label string, since time.Time) []byte {
+	key := camera + "|" + label
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.entries[key]
+	if !ok || e.retained || e.storedAt.Before(since) || time.Since(e.storedAt) > s.ttl {
+		return nil
+	}
+	return e.bytes
 }
 
 // Latest returns the most recently retained snapshot for (camera, label),

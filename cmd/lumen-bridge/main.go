@@ -53,7 +53,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprint(os.Stderr, `lumen-bridge — Frigate ↔ Lumen Bridge Relay (`+version+`)
+	fmt.Fprint(os.Stderr, `lumen-bridge — Frigate → Lumen notifications bridge (`+version+`)
 
 Subcommands:
   run     start the bridge daemon (default for systemd / Docker)
@@ -61,28 +61,24 @@ Subcommands:
             --dry-run           subscribe + decode events but skip relay writes
             --debug             verbose logging
             --health-addr ADDR  bind address for /healthz (default 127.0.0.1:9090)
-  pair    pair with Lumen app to receive a device token from the relay
-            --code CODE         6-digit pairing code from app (required)
-            --relay URL         relay server URL (default wss://relay.lorislab.fr)
-  doctor  preflight check: config, MQTT reachability, Frigate reachability,
-          relay reachability. Exits non-zero on any check failure.
+  pair    pair with the Lumen app and store this bridge's device token
+            --code CODE         6-digit code from Lumen → Paired Bridges (required)
+            --config PATH       read relay.url / relay.device_token_path from here
+            --token-path PATH   override where the token is written
+            --relay URL         override the relay URL
+  doctor  preflight check: config, MQTT reachability, device token,
+          relay reachability, Frigate reachability. Exits non-zero on failure.
   version print version and exit
 
 Configuration: ./config.yaml or /etc/lumen-bridge/config.yaml; every
 field is overridable via env var (LB_*). See README.md.
-
-NOTE on v0.3.0: the CloudKit Web Services sign-in flow (`+"`lumen-bridge auth`"+`)
-was removed because Apple's IDMSA web auth is unreliable for end-users.
-The daemon now talks to the Lumen Bridge Relay Worker via a per-user
-device token from the pair flow. See the project memory note
-project_relay_proxy_migration.md.
 `)
 }
 
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	cfgPath := fs.String("config", "", "path to config.yaml")
-	dryRun := fs.Bool("dry-run", false, "decode MQTT events without writing to CloudKit")
+	dryRun := fs.Bool("dry-run", false, "decode MQTT events without sending anything to the relay")
 	debug := fs.Bool("debug", false, "verbose logging")
 	healthAddr := fs.String("health-addr", defaultHealthAddr(), "bind address for /healthz; empty = disable")
 	_ = fs.Parse(args)
@@ -140,18 +136,20 @@ func runCmd(args []string) {
 		}
 	}
 
-	var frigateCli *frigate.Client
-	if cfg.Frigate.BaseURL != "" {
-		frigateCli = frigate.New(cfg.Frigate.BaseURL)
-	}
-
-	coord := bridge.New(bridge.Options{
+	// Interfaces must stay nil (not a typed nil pointer) when a component
+	// is disabled, or the coordinator would think it is configured.
+	opts := bridge.Options{
 		MQTT:      mqttCli,
-		Relay:     relayCli,
 		Snapshots: snapshots,
-		Frigate:   frigateCli,
 		Logger:    logger,
-	})
+	}
+	if relayCli != nil {
+		opts.Relay = relayCli
+	}
+	if cfg.Frigate.BaseURL != "" {
+		opts.Frigate = frigate.New(cfg.Frigate.BaseURL)
+	}
+	coord := bridge.New(opts)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -218,8 +216,7 @@ func doctorCmd(args []string) {
 		fmt.Println("  ⚠ device token: missing — daemon will only run with --dry-run; run `lumen-bridge pair --code <6-digit>` after generating a code in the Lumen iOS app")
 	}
 
-	// Relay reachability — best-effort GET /health, doesn't fail
-	// preflight if down because the daemon retries forever anyway.
+	// Relay reachability — GET /health must answer 200.
 	relayHealth := cfg.Relay.URL + "/health"
 	if req, err := http.NewRequest(http.MethodGet, relayHealth, nil); err == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -228,6 +225,9 @@ func doctorCmd(args []string) {
 		resp, err := http.DefaultClient.Do(req)
 		if resp != nil {
 			_ = resp.Body.Close()
+			if err == nil && resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("HTTP %d", resp.StatusCode)
+			}
 		}
 		check("relay http "+relayHealth, err)
 	}

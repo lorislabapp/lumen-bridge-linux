@@ -38,7 +38,7 @@ import (
 // Phase 2.5 clip-backfill can locate the same record by name without
 // keeping any state on the bridge side.
 type Event struct {
-	ID         string   `json:"id"`         // Frigate event id — used as recordName base
+	ID         string   `json:"id"` // Frigate event id — used as recordName base
 	Camera     string   `json:"camera"`
 	Label      string   `json:"label"`
 	DetectedAt int64    `json:"detectedAt"` // unix ms — Worker stores as DATE/TIME
@@ -164,8 +164,7 @@ func (c *Client) PostEvent(ctx context.Context, e Event, snapshot *AssetReceipt)
 
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("relay /events/ingest %d: %s",
-			resp.StatusCode, truncate(string(respBody), 200))
+		return nil, &HTTPError{Endpoint: "/events/ingest", Status: resp.StatusCode, Body: truncate(string(respBody), 200)}
 	}
 
 	var parsed PostEventResponse
@@ -211,8 +210,7 @@ func (c *Client) RequestAssetUpload(ctx context.Context, fieldName, frigateID st
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("relay /assets/request-upload %d: %s",
-			resp.StatusCode, truncate(string(respBody), 200))
+		return nil, &HTTPError{Endpoint: "/assets/request-upload", Status: resp.StatusCode, Body: truncate(string(respBody), 200)}
 	}
 	var out RequestUploadResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -327,10 +325,33 @@ func (c *Client) UpdateEventAsset(ctx context.Context, recordName, fieldName str
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("relay /events/update-asset %d: %s",
-			resp.StatusCode, truncate(string(respBody), 200))
+		return &HTTPError{Endpoint: "/events/update-asset", Status: resp.StatusCode, Body: truncate(string(respBody), 200)}
 	}
 	return nil
+}
+
+// HTTPError is a non-200 answer from the relay Worker.
+type HTTPError struct {
+	Endpoint string
+	Status   int
+	Body     string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("relay %s %d: %s", e.Endpoint, e.Status, e.Body)
+}
+
+// Retryable reports whether err is worth retrying: network errors,
+// 429 and 5xx are transient; 4xx (bad token, bad payload) are not.
+func Retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var he *HTTPError
+	if errors.As(err, &he) {
+		return he.Status == http.StatusTooManyRequests || he.Status >= 500
+	}
+	return !errors.Is(err, context.Canceled)
 }
 
 func truncate(s string, n int) string {

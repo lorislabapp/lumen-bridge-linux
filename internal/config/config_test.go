@@ -60,8 +60,8 @@ cloudkit:
 	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("LB_MQTT_PASSWORD", "env-pw")    // not in yaml — picked from env
-	t.Setenv("LB_MQTT_USERNAME", "env-user")  // overrides yaml
+	t.Setenv("LB_MQTT_PASSWORD", "env-pw")   // not in yaml — picked from env
+	t.Setenv("LB_MQTT_USERNAME", "env-user") // overrides yaml
 
 	cfg, err := Load(path)
 	if err != nil {
@@ -108,5 +108,22 @@ func resetEnv(t *testing.T) {
 	} {
 		t.Setenv(k, "")
 		_ = os.Unsetenv(k)
+	}
+}
+
+func TestLoad_ExpandsTildeInTokenPath(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	p := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(p, []byte("mqtt:\n  host: broker\nrelay:\n  device_token_path: ~/.config/lumen-bridge/device-token.json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, ".config", "lumen-bridge", "device-token.json")
+	if cfg.Relay.DeviceTokenPath != want {
+		t.Fatalf("got %q want %q", cfg.Relay.DeviceTokenPath, want)
 	}
 }

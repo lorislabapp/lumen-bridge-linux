@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -59,7 +60,7 @@ func TestDecode_NewEvent(t *testing.T) {
 	if len(ev.Zones) != 1 || ev.Zones[0] != "entry" {
 		t.Errorf("zones: got %v", ev.Zones)
 	}
-	wantStart := time.Unix(1714155600, 0).UTC()
+	wantStart := time.UnixMilli(1714155600123).UTC()
 	if !ev.StartTime.Equal(wantStart) {
 		t.Errorf("startTime: got %v want %v", ev.StartTime, wantStart)
 	}
@@ -103,7 +104,7 @@ func TestDecode_EndEvent(t *testing.T) {
 	if ev.EndTime == nil {
 		t.Fatal("endTime should be non-nil for end events")
 	}
-	wantEnd := time.Unix(1714155615, 0).UTC()
+	wantEnd := time.UnixMilli(1714155615500).UTC()
 	if !ev.EndTime.Equal(wantEnd) {
 		t.Errorf("endTime: got %v want %v", *ev.EndTime, wantEnd)
 	}
@@ -164,5 +165,146 @@ func TestDecode_DropsEmpty(t *testing.T) {
 		if _, ok := env.toEvent(); ok {
 			t.Errorf("case %d: should have dropped empty event", i)
 		}
+	}
+}
+
+// Frigate 0.17: an object that entered "driveway" earlier and is now in
+// "porch" — entered_zones holds the history, current_zones the live zone
+// that may not yet be in entered_zones. Both must be forwarded, deduped,
+// in first-seen order.
+func TestDecode_ZonesMergeEnteredAndCurrent(t *testing.T) {
+	raw := `{"type":"update","after":{"id":"1.2-a","camera":"front","label":"person",
+		"top_score":0.8,"start_time":1,"entered_zones":["driveway","porch"],
+		"current_zones":["porch","mailbox"]}}`
+	var env frigateEventEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		t.Fatal(err)
+	}
+	ev, ok := env.toEvent()
+	if !ok {
+		t.Fatal("!ok")
+	}
+	want := []string{"driveway", "porch", "mailbox"}
+	if len(ev.Zones) != len(want) {
+		t.Fatalf("zones: got %v want %v", ev.Zones, want)
+	}
+	for i := range want {
+		if ev.Zones[i] != want[i] {
+			t.Fatalf("zones: got %v want %v", ev.Zones, want)
+		}
+	}
+}
+
+// current_zones only (object still in its first zone, entered_zones not
+// yet populated) must still produce the zone.
+func TestDecode_ZonesCurrentOnly(t *testing.T) {
+	raw := `{"type":"new","after":{"id":"1.2-a","camera":"front","label":"person",
+		"top_score":0.8,"start_time":1,"entered_zones":[],"current_zones":["mailbox"]}}`
+	var env frigateEventEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		t.Fatal(err)
+	}
+	ev, ok := env.toEvent()
+	if !ok || len(ev.Zones) != 1 || ev.Zones[0] != "mailbox" {
+		t.Fatalf("got ok=%v zones=%v", ok, ev.Zones)
+	}
+}
+
+// No zones at all → empty (non-nil) slice so the relay JSON is [] not null.
+func TestDecode_NoZones(t *testing.T) {
+	raw := `{"type":"new","after":{"id":"1.2-a","camera":"front","label":"car","top_score":0.8,"start_time":1}}`
+	var env frigateEventEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		t.Fatal(err)
+	}
+	ev, ok := env.toEvent()
+	if !ok || ev.Zones == nil || len(ev.Zones) != 0 {
+		t.Fatalf("got ok=%v zones=%#v", ok, ev.Zones)
+	}
+}
+
+// sub_label arrives as a string, a [name, score] pair, null, or an
+// unexpected shape. None of these may drop the event.
+func TestDecode_SubLabelShapes(t *testing.T) {
+	cases := []struct {
+		name, subLabel, want string
+	}{
+		{"string", `"Kevin"`, "Kevin"},
+		{"pair", `["Kevin", 0.92]`, "Kevin"},
+		{"plate pair", `["AB-123-CD", 0.88]`, "AB-123-CD"},
+		{"null", `null`, ""},
+		{"empty array", `[]`, ""},
+		{"number", `42`, ""},
+		{"object", `{"name":"x"}`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := `{"type":"new","after":{"id":"1.2-a","camera":"front","label":"person",
+				"top_score":0.8,"start_time":1,"sub_label":` + tc.subLabel + `}}`
+			var env frigateEventEnvelope
+			if err := json.Unmarshal([]byte(raw), &env); err != nil {
+				t.Fatalf("unmarshal must not fail: %v", err)
+			}
+			ev, ok := env.toEvent()
+			if !ok {
+				t.Fatal("event dropped")
+			}
+			if ev.SubLabel != tc.want {
+				t.Errorf("subLabel: got %q want %q", ev.SubLabel, tc.want)
+			}
+		})
+	}
+}
+
+// Malformed identity fields or scores are dropped, not forwarded.
+func TestDecode_RejectsMalformed(t *testing.T) {
+	cases := []string{
+		`{"type":"new","after":{"id":"1.2-a","camera":"front door","label":"person","top_score":0.5,"start_time":1}}`,
+		`{"type":"new","after":{"id":"1.2-a","camera":"front","label":"","top_score":0.5,"start_time":1}}`,
+		`{"type":"new","after":{"id":"1.2/../a","camera":"front","label":"person","top_score":0.5,"start_time":1}}`,
+		`{"type":"new","after":{"id":"1.2-a","camera":"front","label":"person","top_score":1.5,"start_time":1}}`,
+		`{"type":"new","after":{"id":"1.2-a","camera":"front","label":"person","top_score":0.5,"start_time":1,"current_zones":["bad zone"]}}`,
+	}
+	for i, raw := range cases {
+		var env frigateEventEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("case %d unmarshal: %v", i, err)
+		}
+		if _, ok := env.toEvent(); ok {
+			t.Errorf("case %d: malformed event should be dropped", i)
+		}
+	}
+}
+
+type fakeMsg struct {
+	topic   string
+	payload []byte
+}
+
+func (m fakeMsg) Duplicate() bool   { return false }
+func (m fakeMsg) Qos() byte         { return 0 }
+func (m fakeMsg) Retained() bool    { return false }
+func (m fakeMsg) Topic() string     { return m.topic }
+func (m fakeMsg) MessageID() uint16 { return 0 }
+func (m fakeMsg) Payload() []byte   { return m.payload }
+func (m fakeMsg) Ack()              {}
+
+// End-to-end through the paho callback: raw Frigate 0.17 bytes in,
+// decoded Event out; garbage is dropped without calling the handler.
+func TestHandleMessage_DeliversDecodedEvent(t *testing.T) {
+	var got []Event
+	c := New(Options{TopicPrefix: "frigate"})
+	c.onEvent = func(_ context.Context, ev Event) { got = append(got, ev) }
+	c.handleMessage(nil, fakeMsg{"frigate/events", []byte(`{"type":"new","before":null,"after":{
+		"id":"1730000000.5-xyz","camera":"front_door","label":"person","sub_label":["Kevin",0.91],
+		"top_score":0.84,"start_time":1730000000.5,"entered_zones":["porch"],"current_zones":["porch","mailbox"],
+		"has_clip":false,"has_snapshot":true}}`)})
+	c.handleMessage(nil, fakeMsg{"frigate/events", []byte(`not json`)})
+	if len(got) != 1 {
+		t.Fatalf("got %d events", len(got))
+	}
+	ev := got[0]
+	if ev.SubLabel != "Kevin" || len(ev.Zones) != 2 || ev.Zones[1] != "mailbox" || ev.Phase != PhaseNew {
+		t.Fatalf("decoded: %+v", ev)
 	}
 }

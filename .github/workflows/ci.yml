@@ -14,17 +14,15 @@ permissions:
 
 jobs:
   test:
-    name: Test (Go ${{ matrix.go }})
+    name: Test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        go: ['1.22', '1.23']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go }}
+          # go.mod is the single source of truth (setup-go pins
+          # GOTOOLCHAIN=local, so an older matrix version cannot build it).
+          go-version-file: go.mod
           cache: true
       - name: go vet
         run: go vet ./...
@@ -51,7 +49,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: true
       - name: Build
         env:
@@ -119,9 +117,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          test "$(ls *.tar.gz | wc -l)" -eq 4
+      - name: Release notes from CHANGELOG
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" '/^## / { if (f) exit; if (index($0, "## [" v "]") == 1) f = 1; next } f' CHANGELOG.md > dist/NOTES.md
+          test -s dist/NOTES.md || echo "See CHANGELOG.md" > dist/NOTES.md
+          cat dist/NOTES.md
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          body_path: dist/NOTES.md
           generate_release_notes: true
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true

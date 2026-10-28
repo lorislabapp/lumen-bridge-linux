@@ -1,9 +1,9 @@
 // Package health serves a tiny HTTP endpoint for systemd / Docker / k8s
 // liveness + readiness checks. It exposes:
 //
-//   GET /healthz   →  200 OK with no body (liveness — process is alive)
-//   GET /readyz    →  200 OK if MQTT is connected, 503 otherwise
-//   GET /metrics   →  JSON snapshot of the bridge's counters
+//	GET /healthz   →  200 OK with no body (liveness — process is alive)
+//	GET /readyz    →  200 OK if MQTT is connected, 503 otherwise
+//	GET /metrics   →  JSON snapshot of the bridge's counters
 //
 // The server is read-only and binds to localhost-only by default. Set
 // LB_HEALTH_ADDR=0.0.0.0:9090 to expose it container-wide for Docker

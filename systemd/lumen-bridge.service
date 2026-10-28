@@ -1,12 +1,12 @@
-# Lumen Bridge — Frigate ↔ iCloud CloudKit relay
+# Lumen Bridge for Linux — Frigate → Lumen notifications
 #
 # Install location: /etc/systemd/system/lumen-bridge.service
 # Binary:           /usr/local/bin/lumen-bridge
 # Config:           /etc/lumen-bridge/config.yaml (mode 0600, owned by lumen-bridge user)
-# State:            /var/lib/lumen-bridge/ (token cache)
+# State:            /var/lib/lumen-bridge/device-token.json (from `lumen-bridge pair`)
 
 [Unit]
-Description=Lumen Bridge — forwards Frigate detection events to iCloud CloudKit
+Description=Lumen Bridge — forwards Frigate detection events to the Lumen apps
 Documentation=https://github.com/lorislabapp/lumen-bridge-linux
 After=network-online.target
 Wants=network-online.target
@@ -23,6 +23,7 @@ ExecStart=/usr/local/bin/lumen-bridge run --config /etc/lumen-bridge/config.yaml
 # Persistent state lives under /var/lib/lumen-bridge — created automatically.
 StateDirectory=lumen-bridge
 StateDirectoryMode=0700
+ReadWritePaths=/var/lib/lumen-bridge
 
 # Hardening — the bridge does not need any of these privileges.
 NoNewPrivileges=true
