@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- build stage ----
-FROM golang:1.25-alpine AS build
+# Keep in step with the go directive in go.mod (a supported Go release).
+FROM golang:1.27.3-alpine AS build
 
 WORKDIR /src
 

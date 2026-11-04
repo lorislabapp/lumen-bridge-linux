@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.2] - 2026-11-04
+
+### Security
+- **Built with Go 1.27.3.** 0.3.0 and 0.3.1 were built with Go 1.25.0,
+  which is out of support and has known bugs in `net/http`, `crypto/tls`
+  and `crypto/x509`. The Docker image now builds with `golang:1.27.3-alpine`.
+- **Dependencies updated:** paho.mqtt.golang 1.5.1 (long MQTT strings
+  encoded wrongly), gorilla/websocket 1.5.3 (weak random mask key),
+  golang.org/x/crypto 0.58.0, golang.org/x/net 0.62.0.
+- **CI:** `govulncheck` runs on every push; workflow permissions are
+  read-only except for the jobs that publish.
+
 ## [0.3.1] - 2026-11-04
 
 ### Changed

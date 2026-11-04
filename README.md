@@ -7,7 +7,7 @@ Vision Pro). It is the Linux/Docker companion of
 next to Frigate on your NAS, Pi, Unraid or Proxmox box instead of keeping a
 Mac on.
 
-> **Status: v0.3.1.** MQTT decoding, relay forwarding, snapshot and clip
+> **Status: v0.3.2.** MQTT decoding, relay forwarding, snapshot and clip
 > upload are implemented and unit-tested against the relay's API contract.
 > Not yet validated end-to-end on a real Frigate + iPhone setup by the
 > maintainers — please report problems in
@@ -50,16 +50,16 @@ $EDITOR lumen-bridge/config.yaml            # mqtt.host, credentials, frigate.ba
 sudo chown -R 65532:65532 lumen-bridge      # image runs as distroless "nonroot"
 
 # 1. Check the config
-docker run --rm -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.1 \
+docker run --rm -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.2 \
   doctor --config /data/config.yaml
 
 # 2. Pair (code from the Lumen app, see "Pairing" below)
-docker run --rm -it -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.1 \
+docker run --rm -it -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.2 \
   pair --config /data/config.yaml --code 123456
 
 # 3. Run
 docker run -d --name lumen-bridge --restart unless-stopped \
-  -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.1
+  -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.2
 ```
 
 The image is multi-arch (amd64, arm64). A compose snippet is in
@@ -69,7 +69,7 @@ The image is multi-arch (amd64, arm64). A compose snippet is in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh \
-  | sudo LB_VERSION=v0.3.1 bash
+  | sudo LB_VERSION=v0.3.2 bash
 ```
 
 The script creates a `lumen-bridge` system user, installs the binary to
