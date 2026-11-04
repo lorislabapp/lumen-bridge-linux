@@ -64,29 +64,57 @@ type CloudKitConfig struct {
 // path == ""), then layers env-var overrides on top. Returns a fully-defaulted
 // Config or an error if a *required* field is still missing after both stages.
 func Load(path string) (*Config, error) {
+	cfg, _, err := LoadWithSource(path)
+	return cfg, err
+}
+
+// Source says where the effective config came from, so `doctor` can show
+// the user which file it read and which env vars replaced its values.
+type Source struct {
+	// File is the absolute path of the YAML file that was read, or "" when
+	// no file was found and the config came from defaults + env only.
+	File string
+	// Env lists the LB_* variables that replaced a value (names only).
+	Env []string
+}
+
+// SearchPaths are the locations tried, in order, when no --config is given.
+var SearchPaths = []string{
+	"./config.yaml",
+	"/etc/lumen-bridge/config.yaml",
+}
+
+// LoadWithSource is Load plus a description of where the values came from.
+// The Source is filled in as far as loading got, even on error.
+func LoadWithSource(path string) (*Config, Source, error) {
 	cfg := defaults()
+	var src Source
 
 	if path == "" {
 		path = findConfigFile()
 	}
 	if path != "" {
+		if abs, err := filepath.Abs(path); err == nil {
+			path = abs
+		}
+		src.File = path
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", path, err)
+			return nil, src, fmt.Errorf("read %s: %w", path, err)
 		}
 		if err := yaml.Unmarshal(raw, cfg); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
+			return nil, src, fmt.Errorf("parse %s: %w", path, err)
 		}
 	}
 
-	overlayEnv(cfg)
+	src.Env = overlayEnv(cfg)
 	cfg.Relay.DeviceTokenPath = ExpandHome(cfg.Relay.DeviceTokenPath)
 	cfg.Relay.URL = strings.TrimRight(cfg.Relay.URL, "/")
 
 	if err := cfg.validate(); err != nil {
-		return nil, err
+		return nil, src, err
 	}
-	return cfg, nil
+	return cfg, src, nil
 }
 
 // DefaultRelayURL is the production Lumen Bridge Relay Worker.
@@ -131,10 +159,7 @@ func defaults() *Config {
 }
 
 func findConfigFile() string {
-	for _, p := range []string{
-		"./config.yaml",
-		"/etc/lumen-bridge/config.yaml",
-	} {
+	for _, p := range SearchPaths {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -142,51 +167,38 @@ func findConfigFile() string {
 	return ""
 }
 
-func overlayEnv(c *Config) {
-	if v := os.Getenv("LB_MQTT_HOST"); v != "" {
-		c.MQTT.Host = v
+// overlayEnv applies LB_* overrides and returns the names of the ones used.
+func overlayEnv(c *Config) []string {
+	var applied []string
+	str := func(name string, dst *string) {
+		if v := os.Getenv(name); v != "" {
+			*dst = v
+			applied = append(applied, name)
+		}
 	}
+	str("LB_MQTT_HOST", &c.MQTT.Host)
 	if v := os.Getenv("LB_MQTT_PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.MQTT.Port = n
+			applied = append(applied, "LB_MQTT_PORT")
 		}
 	}
-	if v := os.Getenv("LB_MQTT_USERNAME"); v != "" {
-		c.MQTT.Username = v
-	}
-	if v := os.Getenv("LB_MQTT_PASSWORD"); v != "" {
-		c.MQTT.Password = v
-	}
-	if v := os.Getenv("LB_MQTT_TOPIC_PREFIX"); v != "" {
-		c.MQTT.TopicPrefix = v
-	}
-	if v := os.Getenv("LB_MQTT_CLIENT_ID"); v != "" {
-		c.MQTT.ClientID = v
-	}
+	str("LB_MQTT_USERNAME", &c.MQTT.Username)
+	str("LB_MQTT_PASSWORD", &c.MQTT.Password)
+	str("LB_MQTT_TOPIC_PREFIX", &c.MQTT.TopicPrefix)
+	str("LB_MQTT_CLIENT_ID", &c.MQTT.ClientID)
 	if v := os.Getenv("LB_MQTT_TLS"); v != "" {
 		c.MQTT.TLS = v == "true" || v == "1" || v == "yes"
+		applied = append(applied, "LB_MQTT_TLS")
 	}
-	if v := os.Getenv("LB_FRIGATE_BASE_URL"); v != "" {
-		c.Frigate.BaseURL = v
-	}
-	if v := os.Getenv("LB_CK_CONTAINER"); v != "" {
-		c.CloudKit.Container = v
-	}
-	if v := os.Getenv("LB_CK_ENVIRONMENT"); v != "" {
-		c.CloudKit.Environment = v
-	}
-	if v := os.Getenv("LB_CK_API_TOKEN_PATH"); v != "" {
-		c.CloudKit.APITokenPath = v
-	}
-	if v := os.Getenv("LB_CK_USER_TOKEN_PATH"); v != "" {
-		c.CloudKit.UserTokenPath = v
-	}
-	if v := os.Getenv("LB_RELAY_URL"); v != "" {
-		c.Relay.URL = v
-	}
-	if v := os.Getenv("LB_RELAY_DEVICE_TOKEN_PATH"); v != "" {
-		c.Relay.DeviceTokenPath = v
-	}
+	str("LB_FRIGATE_BASE_URL", &c.Frigate.BaseURL)
+	str("LB_CK_CONTAINER", &c.CloudKit.Container)
+	str("LB_CK_ENVIRONMENT", &c.CloudKit.Environment)
+	str("LB_CK_API_TOKEN_PATH", &c.CloudKit.APITokenPath)
+	str("LB_CK_USER_TOKEN_PATH", &c.CloudKit.UserTokenPath)
+	str("LB_RELAY_URL", &c.Relay.URL)
+	str("LB_RELAY_DEVICE_TOKEN_PATH", &c.Relay.DeviceTokenPath)
+	return applied
 }
 
 func (c *Config) validate() error {

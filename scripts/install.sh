@@ -8,7 +8,7 @@
 #
 # Or with a specific version:
 #
-#   curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh | LB_VERSION=v0.3.0 bash
+#   curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh | LB_VERSION=v0.3.1 bash
 #
 # After install, edit /etc/lumen-bridge/config.yaml, then:
 #   sudo -u lumen-bridge /usr/local/bin/lumen-bridge pair --config /etc/lumen-bridge/config.yaml --code <6-digit>
@@ -19,7 +19,7 @@ set -euo pipefail
 # yet (e.g. /tmp/user/0). Force a known-good location so mktemp works.
 export TMPDIR=/tmp
 
-VERSION="${LB_VERSION:-v0.3.0}"
+VERSION="${LB_VERSION:-v0.3.1}"
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
 case "$ARCH" in
   amd64|x86_64)  ARCH=amd64 ;;

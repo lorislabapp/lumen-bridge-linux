@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.1] - 2026-11-04
+
+### Changed
+- **`doctor` explains what it checks.** It prints the config file it read
+  (or the paths it searched), the `LB_*` variables that replaced values, and
+  where the MQTT host came from. It warns when `mqtt.host` is still the
+  installer's example `192.168.1.50`, and notes when the systemd service
+  reads a different file.
+- **`doctor` runs every check.** A failed check no longer stops the rest;
+  the exit code is 1 if any check failed.
+- **Hints on network errors.** Unknown host, refused connection and
+  timeout each get a next step, including Docker service names (`mqtt`)
+  used from the host and `localhost` used inside a container.
+
 ## [0.3.0] - 2026-10-28
 
 The bridge no longer talks to CloudKit directly. It sends events to the

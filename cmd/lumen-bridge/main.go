@@ -5,8 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -21,7 +19,7 @@ import (
 	"github.com/lorislabapp/lumen-bridge-linux/internal/relay"
 )
 
-const version = "0.3.0"
+const version = "0.3.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -183,81 +181,6 @@ func runCmd(args []string) {
 // authCmd removed in v0.3.0 — see the switch on os.Args[1] for the
 // deprecation message users see. The dispatcher exits before reaching
 // any handler.
-
-// doctorCmd runs a preflight check before the user starts the daemon
-// for real. Each step is independent so a single failure (e.g. Frigate
-// HTTP unreachable) doesn't mask the rest.
-func doctorCmd(args []string) {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
-	cfgPath := fs.String("config", "", "path to config.yaml")
-	_ = fs.Parse(args)
-
-	cfg, err := config.Load(*cfgPath)
-	check("config load", err)
-
-	// MQTT TCP reachability — much cheaper than a full CONNECT, lets us
-	// distinguish "DNS broken" from "broker rejected auth".
-	dialAddr := net.JoinHostPort(cfg.MQTT.Host, fmt.Sprintf("%d", cfg.MQTT.Port))
-	conn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
-	if err == nil {
-		_ = conn.Close()
-	}
-	check("mqtt tcp reach "+dialAddr, err)
-
-	// Device token — present?
-	stored, err := relay.LoadDeviceToken(cfg.Relay.DeviceTokenPath)
-	check("device token load", err)
-	if stored != nil {
-		fmt.Println("  device token: present")
-		if stored.UserRef != "" {
-			fmt.Println("  user ref:    ", stored.UserRef)
-		}
-	} else {
-		fmt.Println("  ⚠ device token: missing — daemon will only run with --dry-run; run `lumen-bridge pair --code <6-digit>` after generating a code in the Lumen iOS app")
-	}
-
-	// Relay reachability — GET /health must answer 200.
-	relayHealth := cfg.Relay.URL + "/health"
-	if req, err := http.NewRequest(http.MethodGet, relayHealth, nil); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
-		resp, err := http.DefaultClient.Do(req)
-		if resp != nil {
-			_ = resp.Body.Close()
-			if err == nil && resp.StatusCode != http.StatusOK {
-				err = fmt.Errorf("HTTP %d", resp.StatusCode)
-			}
-		}
-		check("relay http "+relayHealth, err)
-	}
-
-	// Frigate HTTP — only checked if base_url is configured.
-	if cfg.Frigate.BaseURL != "" {
-		req, _ := http.NewRequest(http.MethodGet, cfg.Frigate.BaseURL+"/api/version", nil)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx)
-		resp, err := http.DefaultClient.Do(req)
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		check("frigate http "+cfg.Frigate.BaseURL, err)
-	} else {
-		fmt.Println("  frigate http: skipped (frigate.base_url not set — clip backfill disabled)")
-	}
-
-	fmt.Println()
-	fmt.Println("✓ doctor complete")
-}
-
-func check(label string, err error) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", label, err)
-		os.Exit(1)
-	}
-	fmt.Printf("  ✓ %s\n", label)
-}
 
 // sweepSnapshots runs Sweep() every 5 minutes to drop expired retained
 // JPEGs. Lightweight; just walks the cache map under a write lock.

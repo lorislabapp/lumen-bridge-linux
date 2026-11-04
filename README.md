@@ -7,7 +7,7 @@ Vision Pro). It is the Linux/Docker companion of
 next to Frigate on your NAS, Pi, Unraid or Proxmox box instead of keeping a
 Mac on.
 
-> **Status: v0.3.0.** MQTT decoding, relay forwarding, snapshot and clip
+> **Status: v0.3.1.** MQTT decoding, relay forwarding, snapshot and clip
 > upload are implemented and unit-tested against the relay's API contract.
 > Not yet validated end-to-end on a real Frigate + iPhone setup by the
 > maintainers — please report problems in
@@ -50,16 +50,16 @@ $EDITOR lumen-bridge/config.yaml            # mqtt.host, credentials, frigate.ba
 sudo chown -R 65532:65532 lumen-bridge      # image runs as distroless "nonroot"
 
 # 1. Check the config
-docker run --rm -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.0 \
+docker run --rm -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.1 \
   doctor --config /data/config.yaml
 
 # 2. Pair (code from the Lumen app, see "Pairing" below)
-docker run --rm -it -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.0 \
+docker run --rm -it -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.1 \
   pair --config /data/config.yaml --code 123456
 
 # 3. Run
 docker run -d --name lumen-bridge --restart unless-stopped \
-  -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.0
+  -v "$PWD/lumen-bridge:/data" ghcr.io/lorislabapp/lumen-bridge-linux:0.3.1
 ```
 
 The image is multi-arch (amd64, arm64). A compose snippet is in
@@ -69,7 +69,7 @@ The image is multi-arch (amd64, arm64). A compose snippet is in
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lorislabapp/lumen-bridge-linux/main/scripts/install.sh \
-  | sudo LB_VERSION=v0.3.0 bash
+  | sudo LB_VERSION=v0.3.1 bash
 ```
 
 The script creates a `lumen-bridge` system user, installs the binary to
@@ -133,7 +133,18 @@ needs a login; port 5000 does not — keep it on your LAN. Without
 - `lumen-bridge run [--dry-run] [--debug]` — `--dry-run` decodes and logs
   events without sending anything.
 - `lumen-bridge doctor` — checks config, broker reachability, device token,
-  relay and Frigate.
+  relay and Frigate. It prints which config file it read and which `LB_*`
+  variables replaced values, runs every check even after a failure, and
+  exits 1 if any check failed.
+  - Doctor shows an address you no longer use? It is reading another file.
+    Without `--config` it uses `./config.yaml`, then
+    `/etc/lumen-bridge/config.yaml`. Pass `--config` with the file the
+    bridge really uses.
+  - Broker set by Docker service name (e.g. `mqtt`)? That name only resolves
+    inside the Docker network. Run doctor in the bridge container:
+    `docker compose run --rm lumen-bridge doctor --config /data/config.yaml`.
+    A bridge on the host needs the broker's IP, or `localhost` if port 1883
+    is published.
 - Health server (default `127.0.0.1:9090`): `/healthz`, `/readyz` (503 while
   MQTT is disconnected), `/metrics` (JSON counters: received, forwarded,
   skipped, dropped, errors, snapshot_uploads, clip_uploads).

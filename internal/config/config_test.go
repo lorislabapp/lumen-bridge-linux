@@ -127,3 +127,29 @@ func TestLoad_ExpandsTildeInTokenPath(t *testing.T) {
 		t.Fatalf("got %q want %q", cfg.Relay.DeviceTokenPath, want)
 	}
 }
+
+func TestLoadWithSource_ReportsFileAndEnv(t *testing.T) {
+	resetEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("mqtt:\n  host: yaml-host\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LB_MQTT_HOST", "mqtt")
+	t.Setenv("LB_MQTT_PORT", "not-a-number")
+
+	cfg, src, err := LoadWithSource(path)
+	if err != nil {
+		t.Fatalf("LoadWithSource: %v", err)
+	}
+	if src.File != path {
+		t.Errorf("File = %q, want %q", src.File, path)
+	}
+	if cfg.MQTT.Host != "mqtt" {
+		t.Errorf("host = %q, want env value", cfg.MQTT.Host)
+	}
+	// An unparsable port is ignored, so it must not be listed as applied.
+	if len(src.Env) != 1 || src.Env[0] != "LB_MQTT_HOST" {
+		t.Errorf("Env = %v, want [LB_MQTT_HOST]", src.Env)
+	}
+}
